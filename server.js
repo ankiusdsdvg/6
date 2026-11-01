@@ -28,7 +28,7 @@ const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 
-const AUDIO_FRAME_MS = 250;
+const AUDIO_FRAME_MS = 200;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 
 const AUDIO_FRAME_BYTES =
@@ -60,7 +60,7 @@ const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-const MAX_VIDEO_BUFFER = 6 * 1024 * 1024;
+const MAX_VIDEO_BUFFER = 1 * 1024 * 1024;
 
 // =====================================================
 // GLOBAL STATE
