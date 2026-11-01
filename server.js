@@ -11,8 +11,8 @@ app.use(express.json());
 // =====================================================
 
 const M3U_URLS = [
-"https://iptv-org.github.io/iptv/categories/xxx.m3u",
-"https://iptv-org.github.io/iptv/countries/vn.m3u"
+"https://raw.githubusercontent.com/ankiusdsdvg/6/main/relaybongden.m3uk",
+"https://iptv-org.github.io/iptv/categories/xxx.m3u"
 ];
 
 const VIDEO_WIDTH = 320;
