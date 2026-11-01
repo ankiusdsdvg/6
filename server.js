@@ -1,6 +1,7 @@
 
 const express = require("express");
 const { spawn } = require("child_process");
+const { performance } = require("perf_hooks");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -16,6 +17,7 @@ const M3U_URLS = [
   "https://iptv-org.github.io/iptv/countries/vn.m3u"
 ];
 
+// VIDEO
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 180;
 const VIDEO_FPS = 12;
@@ -23,13 +25,14 @@ const JPEG_QUALITY = 8;
 
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
-// Audio
+// AUDIO
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 
-const AUDIO_FRAME_MS = 150;
-const AUDIO_INTERVAL = 150;
+// Giữ 250ms như cấu hình bạn thấy âm thanh rõ
+const AUDIO_FRAME_MS = 250;
+const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE *
@@ -37,7 +40,8 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
-const AUDIO_BUFFER_MS = 300;
+// Buffer tối đa 2500ms
+const AUDIO_BUFFER_MS = 2500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -45,17 +49,19 @@ const AUDIO_BUFFER_MAX =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_BUFFER_MS / 1000;
 
-// Decoder / encoder
+// Nếu tiếng chạy trước hình, tăng thông số này.
+// Ví dụ 200 = trì hoãn audio 200ms.
+// Để 0 nếu chưa cần chỉnh độ lệch.
+const AUDIO_SYNC_DELAY_MS = 0;
+
+// DECODER / ENCODER
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
 
-// Không bỏ frame tham chiếu
 const SKIP_NON_REFERENCE = false;
-
-// Đọc nguồn theo tốc độ media
 const INPUT_READRATE = "1";
 
-// Watchdog
+// WATCHDOG
 const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
@@ -78,12 +84,16 @@ let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
 let audioBuffer = Buffer.alloc(0);
-let lastAudioSample = Buffer.from([0, 0]);
+
 let audioClient = null;
 let audioTimer = null;
 
 let audioBlocked = false;
 let audioBlockedSince = 0;
+
+let audioNextTick = 0;
+let audioBytesSent = 0;
+let audioClockStart = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -99,9 +109,11 @@ let manuallyStopped = true;
 
 function parseResolutionFromName(name) {
   const match = name.match(/\((\d{3,4})p\)|\b(\d{3,4})p\b/i);
+
   if (!match) return 0;
 
   const value = Number(match[1] || match[2]);
+
   if (!Number.isFinite(value)) return 0;
 
   return value;
@@ -128,7 +140,9 @@ function parseM3U(content) {
 
     const url = line;
 
-    const isStreamUrl = /^(https?|rtsp|rtmp|udp):\/\//i.test(url);
+    const isStreamUrl =
+      /^(https?|rtsp|rtmp|udp):\/\//i.test(url);
+
     if (!isStreamUrl) {
       currentInfo = null;
       continue;
@@ -173,6 +187,7 @@ function filterChannelsByResolution(list, maxResolution = 720) {
 
   const filtered = list.filter(channel => {
     if (!channel || !channel.resolution) return true;
+
     return channel.resolution <= allowed;
   });
 
@@ -206,10 +221,17 @@ async function loadChannels() {
 
         content = await response.text();
         chosenUrl = url;
+
         break;
+
       } catch (error) {
         lastError = error;
-        console.warn("[M3U] Try failed:", url, error.message);
+
+        console.warn(
+          "[M3U] Try failed:",
+          url,
+          error.message
+        );
       }
     }
 
@@ -238,12 +260,11 @@ async function loadChannels() {
 
 function clearAudioBuffer() {
   audioBuffer = Buffer.alloc(0);
-  lastAudioSample = Buffer.from([0, 0]);
 }
 
 function disconnectAudioClient() {
   if (audioTimer) {
-    clearInterval(audioTimer);
+    clearTimeout(audioTimer);
     audioTimer = null;
   }
 
@@ -254,6 +275,10 @@ function disconnectAudioClient() {
   audioBlocked = false;
   audioBlockedSince = 0;
 
+  audioNextTick = 0;
+  audioBytesSent = 0;
+  audioClockStart = 0;
+
   clearAudioBuffer();
 
   if (oldClient) {
@@ -263,9 +288,14 @@ function disconnectAudioClient() {
   }
 }
 
+// =====================================================
+// PUSH AUDIO
+// =====================================================
+
 function pushAudioBuffer(chunk) {
   if (!chunk || !chunk.length) return;
 
+  // PCM 16-bit cần số byte chẵn
   if (chunk.length % 2 !== 0) {
     chunk = chunk.subarray(0, chunk.length - 1);
   }
@@ -277,99 +307,155 @@ function pushAudioBuffer(chunk) {
     chunk
   ]);
 
-  // Chỉ trim khi buffer đã quá nặng hơn mức an toàn. Không cắt quá mạnh
-  // vì sẽ làm audio bị lặp / nhái trên những kênh có jitter thời gian dài.
-  if (audioBuffer.length > AUDIO_BUFFER_MAX * 1.25) {
+  // Giữ dữ liệu mới nhất, bỏ dữ liệu cũ
+  // khi buffer vượt 2500ms.
+  if (audioBuffer.length > AUDIO_BUFFER_MAX) {
     const excess =
       audioBuffer.length - AUDIO_BUFFER_MAX;
 
     const dropBytes =
-      Math.max(2, excess + (excess % 2));
+      excess + (excess % 2);
 
-    audioBuffer =
-      audioBuffer.subarray(dropBytes);
+    audioBuffer = audioBuffer.subarray(dropBytes);
+
+    console.log(
+      "[AUDIO] Buffer trimmed:",
+      dropBytes,
+      "bytes"
+    );
   }
 }
 
+// =====================================================
+// GET AUDIO FRAME
+// =====================================================
+
 function getAudioFrame() {
+  // Buffer mặc định chứa silence.
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES);
 
-  if (audioBuffer.length >= AUDIO_FRAME_BYTES) {
-    const out =
-      audioBuffer.subarray(0, AUDIO_FRAME_BYTES);
+  const available =
+    Math.min(audioBuffer.length, AUDIO_FRAME_BYTES);
 
-    audioBuffer =
-      audioBuffer.subarray(AUDIO_FRAME_BYTES);
+  if (available > 0) {
+    audioBuffer.copy(
+      frame,
+      0,
+      0,
+      available
+    );
 
-    if (out.length >= 2) {
-      lastAudioSample = Buffer.from(out.subarray(out.length - 2));
-    }
-
-    out.copy(frame, 0);
-    return frame;
+    // Xóa đúng lượng dữ liệu đã sử dụng
+    audioBuffer = audioBuffer.subarray(available);
   }
 
-  // Khi đệm thấp, giữ phần còn lại và lấp chỗ thiếu bằng mẫu cuối cùng.
-  // Tránh chèn silence liên tục khiến âm thanh "nhái" và rít mất nhịp.
-  if (audioBuffer.length > 0) {
-    audioBuffer.copy(frame, 0);
-    lastAudioSample = Buffer.from(frame.subarray(Math.max(0, audioBuffer.length - 2), audioBuffer.length));
-    audioBuffer = Buffer.alloc(0);
-  }
-
-  for (let i = audioBuffer.length; i < AUDIO_FRAME_BYTES; i += 2) {
-    frame[i] = lastAudioSample[0];
-    frame[i + 1] = lastAudioSample[1];
-  }
-
+  // Phần còn thiếu giữ nguyên silence.
   return frame;
 }
 
 // =====================================================
-// AUDIO REALTIME OUTPUT
+// AUDIO CLOCK
+// =====================================================
+
+function scheduleAudioTick() {
+  if (!audioClient || audioClient.destroyed) {
+    disconnectAudioClient();
+    return;
+  }
+
+  const now = performance.now();
+
+  // Tính thời gian còn lại đến lần phát tiếp theo
+  const delay = Math.max(
+    0,
+    audioNextTick - now
+  );
+
+  audioTimer = setTimeout(() => {
+    audioTimer = null;
+
+    audioTick();
+
+  }, delay);
+}
+
+function audioTick() {
+  if (!audioClient || audioClient.destroyed) {
+    disconnectAudioClient();
+    return;
+  }
+
+  if (audioBlocked) {
+    if (Date.now() - audioBlockedSince > 1500) {
+      console.log("[AUDIO] Slow client disconnected");
+      disconnectAudioClient();
+      return;
+    }
+
+    audioTimer = setTimeout(audioTick, 20);
+    return;
+  }
+
+  const frame = getAudioFrame();
+
+  try {
+    const canContinue = audioClient.write(frame);
+
+    audioBytesSent += frame.length;
+
+    if (!canContinue) {
+      audioBlocked = true;
+      audioBlockedSince = Date.now();
+
+      audioClient.once("drain", () => {
+        audioBlocked = false;
+        audioBlockedSince = 0;
+
+        if (audioClient) {
+          scheduleAudioTick();
+        }
+      });
+
+      return;
+    }
+
+  } catch (error) {
+    console.error("[AUDIO WRITE]", error.message);
+
+    disconnectAudioClient();
+    return;
+  }
+
+  // Phát theo đồng hồ tuyệt đối.
+  // Không phát bù nhiều frame liên tục khi bị trễ.
+  audioNextTick += AUDIO_INTERVAL;
+
+  const currentTime = performance.now();
+
+  if (currentTime - audioNextTick > AUDIO_INTERVAL) {
+    audioNextTick = currentTime + AUDIO_INTERVAL;
+  }
+
+  scheduleAudioTick();
+}
+
+// =====================================================
+// START AUDIO TIMER
 // =====================================================
 
 function startAudioTimer() {
   if (audioTimer) {
-    clearInterval(audioTimer);
+    clearTimeout(audioTimer);
+    audioTimer = null;
   }
 
-  audioTimer = setInterval(() => {
-    if (!audioClient || audioClient.destroyed) {
-      disconnectAudioClient();
-      return;
-    }
+  audioNextTick =
+    performance.now() + AUDIO_SYNC_DELAY_MS;
 
-    if (audioBlocked) {
-      if (Date.now() - audioBlockedSince > 1500) {
-        console.log("[AUDIO] Slow client disconnected");
-        disconnectAudioClient();
-      }
+  audioBytesSent = 0;
+  audioClockStart = Date.now();
 
-      return;
-    }
-
-    const frame = getAudioFrame();
-
-    try {
-      const canContinue = audioClient.write(frame);
-
-      if (!canContinue) {
-        audioBlocked = true;
-        audioBlockedSince = Date.now();
-
-        audioClient.once("drain", () => {
-          audioBlocked = false;
-          audioBlockedSince = 0;
-        });
-      }
-
-    } catch (error) {
-      console.error("[AUDIO WRITE]", error.message);
-      disconnectAudioClient();
-    }
-
-  }, AUDIO_INTERVAL);
+  scheduleAudioTick();
 }
 
 // =====================================================
@@ -431,8 +517,7 @@ function processVideoData(chunk, currentGeneration) {
       end + 2
     );
 
-    // Chỉ giữ frame mới nhất.
-    // Trình duyệt sẽ nhận theo nhịp VIDEO_INTERVAL.
+    // Chỉ giữ frame mới nhất
     latestFrame = Buffer.from(jpeg);
 
     frameSequence++;
@@ -508,6 +593,9 @@ function startFFmpeg(channel) {
   console.log("OUTPUT:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
   console.log("FPS:", VIDEO_FPS);
   console.log("AUDIO:", AUDIO_SAMPLE_RATE, "Hz");
+  console.log("AUDIO FRAME:", AUDIO_FRAME_MS, "ms");
+  console.log("AUDIO BUFFER:", AUDIO_BUFFER_MS, "ms");
+  console.log("AUDIO SYNC DELAY:", AUDIO_SYNC_DELAY_MS, "ms");
   console.log("======================================");
 
   lastVideoFrameTime = Date.now();
@@ -520,10 +608,7 @@ function startFFmpeg(channel) {
     "-hide_banner",
     "-loglevel", "warning",
 
-    // ===============================================
     // INPUT NETWORK
-    // ===============================================
-
     "-rw_timeout", "30000000",
 
     "-reconnect", "1",
@@ -536,17 +621,11 @@ function startFFmpeg(channel) {
     "-fflags",
     "+discardcorrupt+genpts",
 
-    // ===============================================
-    // INPUT RATE CONTROL
-    // ===============================================
-
+    // INPUT RATE
     "-readrate",
     INPUT_READRATE,
 
-    // ===============================================
     // DECODER
-    // ===============================================
-
     "-threads",
     String(DECODER_THREADS),
 
@@ -554,10 +633,7 @@ function startFFmpeg(channel) {
       ? ["-skip_frame", "noref"]
       : []),
 
-    // ===============================================
     // INPUT
-    // ===============================================
-
     "-i", channel.url,
 
     // ===============================================
@@ -800,6 +876,7 @@ app.get("/stream", (req, res) => {
     }
 
     const frame = latestFrame;
+
     lastSentSequence = frameSequence;
 
     const header = Buffer.from(
@@ -884,24 +961,38 @@ app.get("/audio", (req, res) => {
 // =====================================================
 
 app.get("/api/channels", (req, res) => {
-  const requested = req.query.quality || req.query.q || req.query.max || "720";
+  const requested =
+    req.query.quality ||
+    req.query.q ||
+    req.query.max ||
+    "720";
+
   const rawValue = String(requested).trim().toLowerCase();
 
   let maxResolution = 720;
+
   if (rawValue === "all" || rawValue === "full") {
     maxResolution = Number.MAX_SAFE_INTEGER;
+
   } else {
     const parsed = Number.parseInt(rawValue, 10);
+
     if (Number.isFinite(parsed) && parsed > 0) {
       maxResolution = parsed;
     }
   }
 
-  const filteredChannels = filterChannelsByResolution(channels, maxResolution);
+  const filteredChannels =
+    filterChannelsByResolution(channels, maxResolution);
 
   res.json({
     success: true,
-    quality: maxResolution === Number.MAX_SAFE_INTEGER ? "all" : String(maxResolution),
+
+    quality:
+      maxResolution === Number.MAX_SAFE_INTEGER
+        ? "all"
+        : String(maxResolution),
+
     channels: filteredChannels
   });
 });
@@ -1013,14 +1104,35 @@ app.get("/health", (req, res) => {
     audioSampleRate: AUDIO_SAMPLE_RATE,
     audioChannels: AUDIO_CHANNELS,
 
+    audioFrameMs: AUDIO_FRAME_MS,
     audioFrameBytes: AUDIO_FRAME_BYTES,
+
     audioInterval: AUDIO_INTERVAL,
 
     audioBufferBytes: audioBuffer.length,
     audioBufferMax: AUDIO_BUFFER_MAX,
 
+    audioBufferDurationMs:
+      Math.round(
+        audioBuffer.length /
+        (AUDIO_SAMPLE_RATE *
+         AUDIO_CHANNELS *
+         AUDIO_BYTES_PER_SAMPLE) * 1000
+      ),
+
     audioClientConnected:
       !!audioClient && !audioClient.destroyed,
+
+    audioBlocked,
+
+    audioBytesSent,
+
+    audioExpectedBytesPerSecond:
+      AUDIO_SAMPLE_RATE *
+      AUDIO_CHANNELS *
+      AUDIO_BYTES_PER_SAMPLE,
+
+    audioSyncDelayMs: AUDIO_SYNC_DELAY_MS,
 
     lastVideoFrameTime,
 
@@ -1045,18 +1157,38 @@ app.get("/", (req, res) => {
       <meta name="viewport" content="width=device-width,initial-scale=1">
       <title>IPTV Streaming Server</title>
     </head>
+
     <body style="background:#111;color:#eee;font-family:Arial;padding:20px">
+
       <h2>IPTV Streaming Server</h2>
 
       <p>Channels: ${channels.length}</p>
       <p>Pipeline: REALTIME HLS MJPEG</p>
       <p>Source: Original resolution</p>
       <p>Input readrate: ${INPUT_READRATE}</p>
-      <p>Video: ${VIDEO_WIDTH}x${VIDEO_HEIGHT} @ ${VIDEO_FPS} FPS</p>
-      <p>Audio: ${AUDIO_SAMPLE_RATE}Hz PCM</p>
 
-      <p><a style="color:#8b7cff" href="/api/channels">Channels</a></p>
-      <p><a style="color:#8b7cff" href="/health">Health</a></p>
+      <p>
+        Video:
+        ${VIDEO_WIDTH}x${VIDEO_HEIGHT}
+        @ ${VIDEO_FPS} FPS
+      </p>
+
+      <p>Audio: ${AUDIO_SAMPLE_RATE}Hz PCM</p>
+      <p>Audio frame: ${AUDIO_FRAME_MS}ms</p>
+      <p>Audio buffer: ${AUDIO_BUFFER_MS}ms</p>
+
+      <p>
+        <a style="color:#8b7cff" href="/api/channels">
+          Channels
+        </a>
+      </p>
+
+      <p>
+        <a style="color:#8b7cff" href="/health">
+          Health
+        </a>
+      </p>
+
     </body>
     </html>
   `);
@@ -1088,6 +1220,9 @@ async function main() {
     console.log("VIDEO:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
     console.log("FPS:", VIDEO_FPS);
     console.log("AUDIO:", AUDIO_SAMPLE_RATE);
+    console.log("AUDIO FRAME:", AUDIO_FRAME_MS);
+    console.log("AUDIO BUFFER:", AUDIO_BUFFER_MS);
+    console.log("AUDIO SYNC DELAY:", AUDIO_SYNC_DELAY_MS);
     console.log("--------------------------------");
   });
 }
