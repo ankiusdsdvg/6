@@ -12,7 +12,7 @@ app.use(express.json());
 // =====================================================
 
 const M3U_URLS = [
-  "https://raw.githubusercontent.com/anhkhanhdeptrai/Tv/main/Vn.m3u",
+  "https://raw.githubusercontent.com/ankiusdsdvg/6/main/Vn.m3u",
   "https://iptv-org.github.io/iptv/countries/vn.m3u"
 ];
 
