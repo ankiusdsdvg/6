@@ -1,4 +1,4 @@
-# ESP32 TV → MJPEG server
+# 
 
 Converts a public HTTP(S) TV stream (HLS/M3U8 or a direct stream supported by FFmpeg) into 320x240 MJPEG at about 10 FPS.
 
