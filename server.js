@@ -1038,27 +1038,7 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width,initial-scale=1">
-      <title>IPTV Streaming Server</title>
-    </head>
-    <body style="background:#111;color:#eee;font-family:Arial;padding:20px">
-      <h2>IPTV Streaming Server</h2>
-
-      <p>Channels: ${channels.length}</p>
-      <p>Pipeline: REALTIME HLS MJPEG</p>
-      <p>Source: Original resolution</p>
-      <p>Input readrate: ${INPUT_READRATE}</p>
-      <p>Video: ${VIDEO_WIDTH}x${VIDEO_HEIGHT} @ ${VIDEO_FPS} FPS</p>
-      <p>Audio: ${AUDIO_SAMPLE_RATE}Hz PCM</p>
-
-      <p><a style="color:#8b7cff" href="/api/channels">Channels</a></p>
-      <p><a style="color:#8b7cff" href="/health">Health</a></p>
-    </body>
-    </html>
+    
   `);
 });
 
