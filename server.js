@@ -37,7 +37,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
-const AUDIO_BUFFER_MS = 2000;
+const AUDIO_BUFFER_MS = 2500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -60,7 +60,7 @@ const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-const MAX_VIDEO_BUFFER = 4 * 1024 * 1024;
+const MAX_VIDEO_BUFFER = 6 * 1024 * 1024;
 
 // =====================================================
 // GLOBAL STATE
