@@ -28,7 +28,7 @@ const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
 
-const AUDIO_FRAME_MS = 240;
+const AUDIO_FRAME_MS = 200;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 
 const AUDIO_FRAME_BYTES =
@@ -37,7 +37,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
-const AUDIO_BUFFER_MS = 2000;
+const AUDIO_BUFFER_MS = 1000;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -595,7 +595,7 @@ function startFFmpeg(channel) {
     "-vn",
 
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=100:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0`,
 
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
