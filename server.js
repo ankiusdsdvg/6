@@ -165,20 +165,14 @@ currentInfo = null;
 return result;
 }
 
-function filterChannelsByResolution(list, maxResolution = 720) {
-if (!Array.isArray(list)) return [];
+function filterChannelsByResolution(list, maxResolution = Number.MAX_SAFE_INTEGER) {
+  if (!Array.isArray(list)) return [];
 
-const target = Number(maxResolution);
-const allowed = Number.isFinite(target) ? target : 720;
-
-const filtered = list.filter(channel => {
-if (!channel || !channel.resolution) return true;
-return channel.resolution <= allowed;
-});
-
-return filtered.length ? filtered : list;
+  // Không dựa vào tên 1080/720 để quyết định chất lượng; đồng bộ audio/video
+  // phải tính theo trọng lượng khung hình thực tế của luồng đang chạy.
+  void maxResolution;
+  return list;
 }
-
 // =====================================================
 // LOAD CHANNELS
 // =====================================================
