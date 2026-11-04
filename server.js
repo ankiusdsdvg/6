@@ -16,20 +16,18 @@ const M3U_URLS = [
   "https://iptv-org.github.io/iptv/countries/vn.m3u"
 ];
 
-// VIDEO
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 180;
-const VIDEO_FPS = 10;
-const JPEG_QUALITY = 10;
+const VIDEO_FPS = 8;
+const JPEG_QUALITY = 8;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
-// AUDIO
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
+
 const AUDIO_FRAME_MS = 180;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
-const AUDIO_BUFFER_MS = 600;
 
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE *
@@ -37,34 +35,39 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
+const AUDIO_BUFFER_MS = 2000;
+
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_BUFFER_MS / 1000;
 
-// FFMPEG
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
+
+const SKIP_NON_REFERENCE = false;
 const INPUT_READRATE = "1";
 
 const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-// BUFFER
-const MAX_VIDEO_BUFFER = 1024 * 1024;
-const MAX_JPEG_FRAME_BYTES = 256 * 1024;
+const MAX_VIDEO_BUFFER = 2 * 1024 * 1024;
+const MAX_JPEG_FRAME_BYTES = 512 * 1024;
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-// RENDER BANDWIDTH
-// Set these in Render Environment Variables.
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu";
+// =====================================================
+// RENDER BANDWIDTH CONFIG
+// =====================================================
+
+const RENDER_API_KEY =
+  process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu ";
 
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
+  process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg "
 )
   .split(",")
   .map(id => id.trim())
@@ -85,11 +88,11 @@ let generation = 0;
 
 let latestFrame = null;
 let frameSequence = 0;
+
 let jpegPending = Buffer.alloc(0);
 
 let videoDroppedFrames = 0;
 let videoInvalidFrames = 0;
-let videoSentFrames = 0;
 
 let audioBuffer = Buffer.alloc(0);
 let lastAudioSample = Buffer.from([0, 0]);
@@ -116,7 +119,11 @@ function parseResolutionFromName(name) {
 
   if (!match) return 0;
 
-  return Number(match[1] || match[2]) || 0;
+  const value = Number(match[1] || match[2]);
+
+  if (!Number.isFinite(value)) return 0;
+
+  return value;
 }
 
 function parseM3U(content) {
@@ -140,7 +147,10 @@ function parseM3U(content) {
 
     const url = line;
 
-    if (!/^(https?|rtsp|rtmp|udp):\/\//i.test(url)) {
+    const isStreamUrl =
+      /^(https?|rtsp|rtmp|udp):\/\//i.test(url);
+
+    if (!isStreamUrl) {
       currentInfo = null;
       continue;
     }
@@ -158,13 +168,15 @@ function parseM3U(content) {
     const idMatch =
       currentInfo.match(/tvg-id="([^"]*)"/i);
 
+    const resolution = parseResolutionFromName(name);
+
     result.push({
       id: String(result.length),
       name,
       group: groupMatch ? groupMatch[1] : "",
       logo: logoMatch ? logoMatch[1] : "",
       tvgId: idMatch ? idMatch[1] : "",
-      resolution: parseResolutionFromName(name),
+      resolution,
       url
     });
 
@@ -174,18 +186,15 @@ function parseM3U(content) {
   return result;
 }
 
-function filterChannelsByResolution(list, maxResolution) {
+function filterChannelsByResolution(
+  list,
+  maxResolution = Number.MAX_SAFE_INTEGER
+) {
   if (!Array.isArray(list)) return [];
 
-  if (maxResolution === Number.MAX_SAFE_INTEGER) {
-    return list;
-  }
+  void maxResolution;
 
-  // Keep unknown-resolution channels.
-  return list.filter(channel =>
-    !channel.resolution ||
-    channel.resolution <= maxResolution
-  );
+  return list;
 }
 
 // =====================================================
@@ -193,39 +202,58 @@ function filterChannelsByResolution(list, maxResolution) {
 // =====================================================
 
 async function loadChannels() {
-  console.log("[M3U] Loading playlist...");
+  try {
+    console.log("[M3U] Loading playlist...");
 
-  let lastError = null;
+    let lastError = null;
+    let content = "";
+    let chosenUrl = "";
 
-  for (const url of M3U_URLS) {
-    try {
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0"
-        },
-        signal: AbortSignal.timeout(20000)
-      });
+    for (const url of M3U_URLS) {
+      try {
+        const response = await fetch(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0"
+          },
+          signal: AbortSignal.timeout(20000)
+        });
 
-      if (!response.ok) {
-        throw new Error("HTTP " + response.status);
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+
+        content = await response.text();
+        chosenUrl = url;
+        break;
+
+      } catch (error) {
+        lastError = error;
+
+        console.warn(
+          "[M3U] Try failed:",
+          url,
+          error.message
+        );
       }
-
-      const content = await response.text();
-
-      channels = parseM3U(content);
-
-      console.log("[M3U] Loaded:", url);
-      console.log("[M3U] Channels:", channels.length);
-
-      return channels;
-
-    } catch (error) {
-      lastError = error;
-      console.warn("[M3U] Failed:", url, error.message);
     }
-  }
 
-  throw lastError || new Error("No playlist available");
+    if (!content) {
+      throw lastError || new Error("No playlist available");
+    }
+
+    channels = parseM3U(content);
+
+    console.log("--------------------------------");
+    console.log("M3U URL:", chosenUrl);
+    console.log("TOTAL CHANNELS:", channels.length);
+    console.log("--------------------------------");
+
+    return channels;
+
+  } catch (error) {
+    console.error("[M3U ERROR]", error.message);
+    throw error;
+  }
 }
 
 // =====================================================
@@ -237,17 +265,28 @@ app.get("/api/bandwidth", async (req, res) => {
     if (!RENDER_API_KEY) {
       return res.status(500).json({
         success: false,
-        error: "Missing RENDER_API_KEY environment variable"
+        error: "Missing RENDER_API_KEY"
       });
     }
 
-    if (!RENDER_SERVICE_IDS.length) {
+    if (RENDER_SERVICE_IDS.length === 0) {
       return res.status(500).json({
         success: false,
-        error: "Missing RENDER_SERVICE_IDS environment variable"
+        error: "Missing RENDER_SERVICE_IDS"
       });
     }
 
+    if (
+      !Number.isFinite(BANDWIDTH_LIMIT_GB) ||
+      BANDWIDTH_LIMIT_GB <= 0
+    ) {
+      return res.status(500).json({
+        success: false,
+        error: "Invalid BANDWIDTH_LIMIT_GB"
+      });
+    }
+
+    // Current month UTC
     const now = new Date();
 
     const start = new Date(Date.UTC(
@@ -260,33 +299,49 @@ app.get("/api/bandwidth", async (req, res) => {
       "https://api.render.com/v1/metrics/bandwidth"
     );
 
-    url.searchParams.set("startTime", start.toISOString());
-    url.searchParams.set("endTime", now.toISOString());
+    url.searchParams.set(
+      "startTime",
+      start.toISOString()
+    );
 
+    url.searchParams.set(
+      "endTime",
+      now.toISOString()
+    );
+
+    // Add every service ID
     for (const id of RENDER_SERVICE_IDS) {
       url.searchParams.append("resource", id);
     }
 
+    console.log("[BANDWIDTH] Requesting Render metrics...");
+
     const response = await fetch(url, {
+      method: "GET",
+
       headers: {
-        Authorization: `Bearer ${RENDER_API_KEY}`,
-        Accept: "application/json"
+        "Authorization": `Bearer ${RENDER_API_KEY}`,
+        "Accept": "application/json"
       },
+
       signal: AbortSignal.timeout(20000)
     });
 
     if (!response.ok) {
+      const errorText = await response.text();
+
       return res.status(response.status).json({
         success: false,
         error: "Render API error",
-        details: await response.text()
+        httpStatus: response.status,
+        details: errorText
       });
     }
 
     const data = await response.json();
 
     if (!Array.isArray(data)) {
-      throw new Error("Invalid Render API response");
+      throw new Error("Invalid Render bandwidth response");
     }
 
     let usedGB = 0;
@@ -307,11 +362,13 @@ app.get("/api/bandwidth", async (req, res) => {
         ? serviceLabel.value
         : "unknown";
 
-      const unit = String(series.unit || "GB").toUpperCase();
+      const unit = String(
+        series.unit || "GB"
+      ).toUpperCase();
 
       let serviceGB = 0;
 
-      for (const point of series.values || []) {
+      for (const point of (series.values || [])) {
         const value = Number(point.value);
 
         if (!Number.isFinite(value)) continue;
@@ -327,7 +384,9 @@ app.get("/api/bandwidth", async (req, res) => {
         ) {
           serviceGB += value / (1024 ** 3);
         } else {
-          throw new Error("Unsupported unit: " + unit);
+          throw new Error(
+            "Unsupported bandwidth unit: " + unit
+          );
         }
 
         totalPoints++;
@@ -350,8 +409,11 @@ app.get("/api/bandwidth", async (req, res) => {
       BANDWIDTH_LIMIT_GB - usedGB
     );
 
-    const usedPercent = Number(
-      Math.min(100, usedGB / BANDWIDTH_LIMIT_GB * 100).toFixed(2)
+    const usedPercent = Math.min(
+      100,
+      Number(
+        (usedGB / BANDWIDTH_LIMIT_GB * 100).toFixed(2)
+      )
     );
 
     const remainingPercent = Number(
@@ -362,12 +424,23 @@ app.get("/api/bandwidth", async (req, res) => {
 
     if (remainingGB <= 0) {
       status = "LIMIT_REACHED";
-    } else if (remainingGB <= BANDWIDTH_LIMIT_GB * 0.1) {
+    } else if (
+      remainingGB <= BANDWIDTH_LIMIT_GB * 0.1
+    ) {
       status = "WARNING";
     }
 
+    console.log(
+      "[BANDWIDTH]",
+      "Used:", usedGB,
+      "GB /",
+      BANDWIDTH_LIMIT_GB,
+      "GB"
+    );
+
     res.json({
       success: true,
+
       provider: "Render Official API",
 
       period: {
@@ -385,6 +458,7 @@ app.get("/api/bandwidth", async (req, res) => {
       },
 
       status,
+
       services,
 
       serviceCount: RENDER_SERVICE_IDS.length,
@@ -393,10 +467,16 @@ app.get("/api/bandwidth", async (req, res) => {
 
       updatedAt: new Date().toISOString(),
 
-      note: "Render metrics may be delayed and may not represent real-time billing."
+      note:
+        "Metrics are delayed and may not equal the exact real-time billing balance. Include all workspace services to estimate shared usage."
     });
 
   } catch (error) {
+    console.error(
+      "[BANDWIDTH ERROR]",
+      error.message
+    );
+
     res.status(500).json({
       success: false,
       error: error.message
@@ -422,6 +502,7 @@ function disconnectAudioClient() {
   const oldClient = audioClient;
 
   audioClient = null;
+
   audioBlocked = false;
   audioBlockedSince = 0;
 
@@ -443,12 +524,17 @@ function pushAudioBuffer(chunk) {
 
   if (!chunk.length) return;
 
-  audioBuffer = Buffer.concat([audioBuffer, chunk]);
+  audioBuffer = Buffer.concat([
+    audioBuffer,
+    chunk
+  ]);
 
-  // Drop oldest audio if buffer gets too large.
-  if (audioBuffer.length > AUDIO_BUFFER_MAX) {
-    const excess = audioBuffer.length - AUDIO_BUFFER_MAX;
-    const dropBytes = excess + (excess % 2);
+  if (audioBuffer.length > AUDIO_BUFFER_MAX * 1.25) {
+    const excess =
+      audioBuffer.length - AUDIO_BUFFER_MAX;
+
+    const dropBytes =
+      Math.max(2, excess + (excess % 2));
 
     audioBuffer = audioBuffer.subarray(dropBytes);
   }
@@ -458,15 +544,18 @@ function getAudioFrame() {
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES);
 
   if (audioBuffer.length >= AUDIO_FRAME_BYTES) {
-    const out = audioBuffer.subarray(0, AUDIO_FRAME_BYTES);
+    const out =
+      audioBuffer.subarray(0, AUDIO_FRAME_BYTES);
 
-    audioBuffer = audioBuffer.subarray(AUDIO_FRAME_BYTES);
+    audioBuffer =
+      audioBuffer.subarray(AUDIO_FRAME_BYTES);
+
+    if (out.length >= 2) {
+      lastAudioSample =
+        Buffer.from(out.subarray(out.length - 2));
+    }
 
     out.copy(frame);
-
-    lastAudioSample = Buffer.from(
-      out.subarray(out.length - 2)
-    );
 
     return frame;
   }
@@ -477,14 +566,20 @@ function getAudioFrame() {
     audioBuffer.copy(frame, 0);
 
     lastAudioSample = Buffer.from(
-      frame.subarray(remaining - 2, remaining)
+      frame.subarray(
+        Math.max(0, remaining - 2),
+        remaining
+      )
     );
 
     audioBuffer = Buffer.alloc(0);
   }
 
-  // Fill missing samples with last sample.
-  for (let i = 0; i < AUDIO_FRAME_BYTES; i += 2) {
+  for (
+    let i = 0;
+    i < AUDIO_FRAME_BYTES;
+    i += 2
+  ) {
     frame[i] = lastAudioSample[0];
     frame[i + 1] = lastAudioSample[1];
   }
@@ -493,11 +588,13 @@ function getAudioFrame() {
 }
 
 // =====================================================
-// AUDIO OUTPUT
+// AUDIO REALTIME OUTPUT
 // =====================================================
 
 function startAudioTimer() {
-  if (audioTimer) clearInterval(audioTimer);
+  if (audioTimer) {
+    clearInterval(audioTimer);
+  }
 
   audioTimer = setInterval(() => {
     if (!audioClient || audioClient.destroyed) {
@@ -517,9 +614,9 @@ function startAudioTimer() {
     const frame = getAudioFrame();
 
     try {
-      const ok = audioClient.write(frame);
+      const canContinue = audioClient.write(frame);
 
-      if (!ok) {
+      if (!canContinue) {
         audioBlocked = true;
         audioBlockedSince = Date.now();
 
@@ -543,6 +640,7 @@ function startAudioTimer() {
 
 function clearVideoBuffer() {
   jpegPending = Buffer.alloc(0);
+
   latestFrame = null;
   frameSequence = 0;
 }
@@ -551,16 +649,20 @@ function processVideoData(chunk, currentGeneration) {
   if (currentGeneration !== generation) return;
   if (!chunk || !chunk.length) return;
 
-  jpegPending = Buffer.concat([jpegPending, chunk]);
+  jpegPending = Buffer.concat([
+    jpegPending,
+    chunk
+  ]);
 
   while (jpegPending.length > 0) {
     const start = jpegPending.indexOf(JPEG_SOI);
 
     if (start < 0) {
-      jpegPending = jpegPending.length &&
-        jpegPending[jpegPending.length - 1] === 0xff
-        ? jpegPending.subarray(-1)
-        : Buffer.alloc(0);
+      if (jpegPending[jpegPending.length - 1] === 0xff) {
+        jpegPending = jpegPending.subarray(-1);
+      } else {
+        jpegPending = Buffer.alloc(0);
+      }
 
       return;
     }
@@ -575,11 +677,17 @@ function processVideoData(chunk, currentGeneration) {
       if (jpegPending.length > MAX_JPEG_FRAME_BYTES) {
         videoInvalidFrames++;
 
-        const nextStart = jpegPending.indexOf(JPEG_SOI, 2);
+        const nextStart = jpegPending.indexOf(
+          JPEG_SOI,
+          2
+        );
 
-        jpegPending = nextStart >= 0
-          ? jpegPending.subarray(nextStart)
-          : Buffer.alloc(0);
+        if (nextStart >= 0) {
+          jpegPending = jpegPending.subarray(nextStart);
+          continue;
+        }
+
+        jpegPending = Buffer.alloc(0);
       }
 
       return;
@@ -589,18 +697,20 @@ function processVideoData(chunk, currentGeneration) {
 
     if (frameLength > MAX_JPEG_FRAME_BYTES) {
       videoInvalidFrames++;
+
       jpegPending = jpegPending.subarray(frameLength);
+
       continue;
     }
 
     const jpeg = jpegPending.subarray(0, frameLength);
 
-    // Always keep only the newest complete frame.
     if (latestFrame !== null) {
       videoDroppedFrames++;
     }
 
     latestFrame = Buffer.from(jpeg);
+
     frameSequence++;
 
     lastVideoFrameTime = Date.now();
@@ -609,11 +719,13 @@ function processVideoData(chunk, currentGeneration) {
   }
 
   if (jpegPending.length > MAX_VIDEO_BUFFER) {
-    const nextStart = jpegPending.lastIndexOf(JPEG_SOI);
+    const lastStart = jpegPending.lastIndexOf(JPEG_SOI);
 
-    jpegPending = nextStart >= 0
-      ? jpegPending.subarray(nextStart)
-      : Buffer.alloc(0);
+    if (lastStart >= 0) {
+      jpegPending = jpegPending.subarray(lastStart);
+    } else {
+      jpegPending = Buffer.alloc(0);
+    }
 
     videoInvalidFrames++;
   }
@@ -640,6 +752,7 @@ function stopFFmpeg() {
   }
 
   disconnectAudioClient();
+
   clearVideoBuffer();
 
   if (ffmpeg) {
@@ -672,17 +785,20 @@ function startFFmpeg(channel) {
 
   videoDroppedFrames = 0;
   videoInvalidFrames = 0;
-  videoSentFrames = 0;
 
   const currentGeneration = generation;
 
   console.log("");
   console.log("======================================");
   console.log("START CHANNEL:", channel.name);
+  console.log("URL:", channel.url);
+  console.log("GENERATION:", currentGeneration);
+  console.log("READRATE:", INPUT_READRATE);
+  console.log("DECODER THREADS:", DECODER_THREADS);
+  console.log("SKIP NONREF:", SKIP_NON_REFERENCE);
   console.log("OUTPUT:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
   console.log("FPS:", VIDEO_FPS);
-  console.log("JPEG QUALITY:", JPEG_QUALITY);
-  console.log("READRATE:", INPUT_READRATE);
+  console.log("AUDIO:", AUDIO_SAMPLE_RATE, "Hz");
   console.log("======================================");
 
   lastVideoFrameTime = Date.now();
@@ -691,8 +807,8 @@ function startFFmpeg(channel) {
     "-hide_banner",
     "-loglevel", "warning",
 
-    // Network timeout and reconnect.
     "-rw_timeout", "30000000",
+
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
@@ -700,15 +816,8 @@ function startFFmpeg(channel) {
     "-user_agent",
     "Mozilla/5.0",
 
-    // Input handling.
     "-fflags",
     "+discardcorrupt+genpts",
-
-    "-probesize",
-    "1000000",
-
-    "-analyzeduration",
-    "1000000",
 
     "-readrate",
     INPUT_READRATE,
@@ -716,13 +825,13 @@ function startFFmpeg(channel) {
     "-threads",
     String(DECODER_THREADS),
 
-    "-i",
-    channel.url,
+    ...(SKIP_NON_REFERENCE
+      ? ["-skip_frame", "noref"]
+      : []),
 
-    // ===============================================
-    // VIDEO OUTPUT
-    // ===============================================
+    "-i", channel.url,
 
+    // VIDEO
     "-map", "0:v:0?",
     "-an",
 
@@ -731,54 +840,39 @@ function startFFmpeg(channel) {
       `fps=${VIDEO_FPS}:round=down`,
       `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
       `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
-      "setsar=1"
+      "setsar=1",
+      `setpts=N/(${VIDEO_FPS}*TB)`
     ].join(","),
 
-    "-q:v",
-    String(JPEG_QUALITY),
+    "-q:v", String(JPEG_QUALITY),
 
     "-threads",
     String(ENCODER_THREADS),
 
-    // fps filter already controls output frame rate.
-    "-fps_mode",
-    "passthrough",
+    "-fps_mode", "cfr",
 
-    "-flush_packets",
-    "1",
+    "-flush_packets", "1",
 
-    "-f",
-    "image2pipe",
-
-    "-vcodec",
-    "mjpeg",
+    "-f", "image2pipe",
+    "-vcodec", "mjpeg",
 
     "pipe:1",
 
-    // ===============================================
-    // AUDIO OUTPUT
-    // ===============================================
-
+    // AUDIO
     "-map", "0:a:0?",
     "-vn",
 
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=100:first_pts=0`,
 
-    "-ac",
-    String(AUDIO_CHANNELS),
+    "-ac", String(AUDIO_CHANNELS),
+    "-ar", String(AUDIO_SAMPLE_RATE),
 
-    "-ar",
-    String(AUDIO_SAMPLE_RATE),
+    "-c:a", "pcm_s16le",
 
-    "-c:a",
-    "pcm_s16le",
+    "-flush_packets", "1",
 
-    "-flush_packets",
-    "1",
-
-    "-f",
-    "s16le",
+    "-f", "s16le",
 
     "pipe:3"
   ];
@@ -801,6 +895,7 @@ function startFFmpeg(channel) {
   if (processRef.stdio[3]) {
     processRef.stdio[3].on("data", chunk => {
       if (currentGeneration !== generation) return;
+
       pushAudioBuffer(chunk);
     });
   }
@@ -818,7 +913,12 @@ function startFFmpeg(channel) {
   });
 
   processRef.on("close", (code, signal) => {
-    console.log("[FFmpeg] Exited:", code, signal);
+    console.log(
+      "[FFmpeg] Exited:",
+      code,
+      "signal:",
+      signal
+    );
 
     if (currentGeneration !== generation) return;
 
@@ -839,9 +939,15 @@ function startFFmpeg(channel) {
     const elapsed = Date.now() - lastVideoFrameTime;
 
     if (elapsed > VIDEO_TIMEOUT) {
-      console.log("[WATCHDOG] No video frame:", elapsed);
+      console.log(
+        "[WATCHDOG] No video frame:",
+        elapsed,
+        "ms"
+      );
+
       scheduleRestart();
     }
+
   }, WATCHDOG_INTERVAL);
 }
 
@@ -854,9 +960,14 @@ function scheduleRestart() {
 
   restarting = true;
 
-  console.log("[RESTART] Restarting in", RESTART_DELAY, "ms");
+  console.log(
+    "[RESTART] Restarting in",
+    RESTART_DELAY,
+    "ms"
+  );
 
   disconnectAudioClient();
+
   clearVideoBuffer();
 
   if (watchdogTimer) {
@@ -873,7 +984,9 @@ function scheduleRestart() {
     } catch (_) {}
   }
 
-  if (restartTimer) clearTimeout(restartTimer);
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+  }
 
   restartTimer = setTimeout(() => {
     restartTimer = null;
@@ -882,11 +995,12 @@ function scheduleRestart() {
     if (currentChannel && !manuallyStopped) {
       startFFmpeg(currentChannel);
     }
+
   }, RESTART_DELAY);
 }
 
 // =====================================================
-// VIDEO STREAM - LOW LATENCY MJPEG
+// VIDEO STREAM - MJPEG
 // =====================================================
 
 app.get("/stream", (req, res) => {
@@ -895,8 +1009,7 @@ app.get("/stream", (req, res) => {
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
     "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-    "Content-Encoding": "identity"
+    "X-Accel-Buffering": "no"
   });
 
   let lastSentSequence = -1;
@@ -919,16 +1032,10 @@ app.get("/stream", (req, res) => {
     }
 
     if (!latestFrame) return;
+
     if (frameSequence === lastSentSequence) return;
 
-    // Do not send an already stale frame.
-    if (Date.now() - lastVideoFrameTime > 2000) return;
-
-    // If the network has a large pending queue, wait for it to drain.
-    if (res.writableLength > 512 * 1024) {
-      videoDroppedFrames++;
-      return;
-    }
+    if (Date.now() - lastVideoFrameTime > 3000) return;
 
     const frame = latestFrame;
     const sequence = frameSequence;
@@ -950,7 +1057,6 @@ app.get("/stream", (req, res) => {
       const ok = res.write(packet);
 
       lastSentSequence = sequence;
-      videoSentFrames++;
 
       if (!ok) {
         blocked = true;
@@ -962,17 +1068,12 @@ app.get("/stream", (req, res) => {
         });
       }
 
-    } catch (error) {
-      console.error("[VIDEO WRITE]", error.message);
+    } catch (_) {
       clearInterval(timer);
       res.destroy();
     }
 
   }, VIDEO_INTERVAL);
-
-  req.on("close", () => {
-    clearInterval(timer);
-  });
 
   res.on("close", () => {
     clearInterval(timer);
@@ -985,6 +1086,7 @@ app.get("/stream", (req, res) => {
 
 app.get("/audio", (req, res) => {
   disconnectAudioClient();
+
   clearAudioBuffer();
 
   audioClient = res;
@@ -1045,12 +1147,23 @@ app.get("/api/channels", (req, res) => {
   const filteredChannels =
     filterChannelsByResolution(channels, maxResolution);
 
+  const resetSeconds = Math.max(3, Math.ceil(RESTART_DELAY / 1000));
+
+  const channelsWithReset = filteredChannels.map(channel => ({
+    ...channel,
+    resetSeconds,
+    resetAtMs: Date.now() + (resetSeconds * 1000)
+  }));
+
   res.json({
     success: true,
-    quality: maxResolution === Number.MAX_SAFE_INTEGER
-      ? "all"
-      : String(maxResolution),
-    channels: filteredChannels
+
+    quality:
+      maxResolution === Number.MAX_SAFE_INTEGER
+        ? "all"
+        : String(maxResolution),
+
+    channels: channelsWithReset
   });
 });
 
@@ -1059,13 +1172,7 @@ app.get("/api/channels", (req, res) => {
 // =====================================================
 
 function selectChannelHandler(req, res) {
-  let id;
-
-  try {
-    id = decodeURIComponent(req.params.id);
-  } catch (_) {
-    id = req.params.id;
-  }
+  const id = decodeURIComponent(req.params.id);
 
   const channel = channels.find(c =>
     c.id === id ||
@@ -1096,6 +1203,7 @@ app.post("/api/select/:id", selectChannelHandler);
 
 function stopHandler(req, res) {
   stopFFmpeg();
+
   currentChannel = null;
 
   res.json({
@@ -1143,12 +1251,18 @@ app.get("/health", (req, res) => {
       : null,
 
     ffmpegRunning: !!ffmpeg,
+
     restarting,
     manuallyStopped,
 
-    pipeline: "LOW_LATENCY_MJPEG_LATEST_FRAME",
+    pipeline: "REALTIME_HLS_MJPEG_VIDEO_LOW_LATENCY",
 
     inputReadrate: INPUT_READRATE,
+
+    sourceResolution: "ORIGINAL",
+
+    skipNonReferenceFrames:
+      SKIP_NON_REFERENCE,
 
     decoderThreads: DECODER_THREADS,
     encoderThreads: ENCODER_THREADS,
@@ -1156,11 +1270,9 @@ app.get("/health", (req, res) => {
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
-    jpegQuality: JPEG_QUALITY,
 
     videoDroppedFrames,
     videoInvalidFrames,
-    videoSentFrames,
 
     videoPendingBytes: jpegPending.length,
 
@@ -1169,12 +1281,6 @@ app.get("/health", (req, res) => {
       : 0,
 
     videoFrameSequence: frameSequence,
-
-    lastVideoFrameTime,
-
-    videoFrameAge: lastVideoFrameTime
-      ? Date.now() - lastVideoFrameTime
-      : null,
 
     audioSampleRate: AUDIO_SAMPLE_RATE,
     audioChannels: AUDIO_CHANNELS,
@@ -1188,6 +1294,12 @@ app.get("/health", (req, res) => {
     audioClientConnected:
       !!audioClient && !audioClient.destroyed,
 
+    lastVideoFrameTime,
+
+    videoFrameAge: lastVideoFrameTime
+      ? Date.now() - lastVideoFrameTime
+      : null,
+
     generation
   });
 });
@@ -1197,7 +1309,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("");
+  res.send("IPTV SERVER RUNNING");
 });
 
 // =====================================================
@@ -1207,8 +1319,12 @@ app.get("/", (req, res) => {
 async function main() {
   try {
     await loadChannels();
+
   } catch (error) {
-    console.log("[STARTUP] Playlist load failed:", error.message);
+    console.log(
+      "[STARTUP] Playlist load failed:",
+      error.message
+    );
   }
 
   app.listen(PORT, "0.0.0.0", () => {
@@ -1216,12 +1332,25 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log("PIPELINE: LOW LATENCY MJPEG");
+    console.log("PIPELINE: REALTIME HLS MJPEG");
+    console.log("INPUT READRATE:", INPUT_READRATE);
+    console.log("SOURCE: ORIGINAL RESOLUTION");
     console.log("VIDEO:", VIDEO_WIDTH + "x" + VIDEO_HEIGHT);
     console.log("FPS:", VIDEO_FPS);
-    console.log("JPEG QUALITY:", JPEG_QUALITY);
     console.log("AUDIO:", AUDIO_SAMPLE_RATE);
-    console.log("BANDWIDTH API: /api/bandwidth");
+
+    console.log("--------------------------------");
+    console.log("BANDWIDTH MONITOR:");
+    console.log("API: /api/bandwidth");
+    console.log("LIMIT:", BANDWIDTH_LIMIT_GB, "GB");
+    console.log(
+      "SERVICE IDS:",
+      RENDER_SERVICE_IDS.length
+    );
+    console.log(
+      "API KEY:",
+      RENDER_API_KEY ? "CONFIGURED" : "MISSING"
+    );
     console.log("--------------------------------");
   });
 }
