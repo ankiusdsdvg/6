@@ -1197,7 +1197,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - LOW LATENCY MJPEG");
+  res.send("");
 });
 
 // =====================================================
