@@ -409,6 +409,21 @@ app.get("/api/bandwidth", async (req, res) => {
       BANDWIDTH_LIMIT_GB - usedGB
     );
 
+    const resetAt = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth() + 1,
+      1,
+      0,
+      0,
+      0,
+      0
+    ));
+
+    const resetInSeconds = Math.max(
+      0,
+      Math.ceil((resetAt.getTime() - Date.now()) / 1000)
+    );
+
     const usedPercent = Math.min(
       100,
       Number(
@@ -456,6 +471,9 @@ app.get("/api/bandwidth", async (req, res) => {
         usedPercent,
         remainingPercent
       },
+
+      resetInSeconds,
+      resetAt: resetAt.toISOString(),
 
       status,
 
