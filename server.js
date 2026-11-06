@@ -27,17 +27,24 @@ const AUDIO_FRAME_MS = 200;
 const AUDIO_FRAME_BYTES =
   AUDIO_RATE * AUDIO_CHANNELS * 2 * AUDIO_FRAME_MS / 1000;
 
-// Chỉ giữ tối đa 200ms audio
-const MAX_AUDIO_BUFFER = AUDIO_FRAME_BYTES;
+// Bộ đệm chung theo thời gian
+const BUFFER_DELAY_MS = 1500;
+const MAX_BUFFER_MS = 4000;
 
-// Video
+// Giới hạn bộ đệm hình
 const MAX_JPEG_BYTES = 256 * 1024;
 const MAX_VIDEO_PENDING_BYTES = 512 * 1024;
-const MAX_VIDEO_CLIENT_BUFFER = 300 * 1024;
-const VIDEO_CLIENT_TIMEOUT_MS = 1000;
+const MAX_VIDEO_QUEUE_FRAMES =
+  Math.ceil(VIDEO_FPS * MAX_BUFFER_MS / 1000);
 
-// Audio
-const AUDIO_CLIENT_TIMEOUT_MS = 1000;
+const MAX_VIDEO_CLIENT_BUFFER = 300 * 1024;
+const VIDEO_CLIENT_TIMEOUT_MS = 3000;
+
+// Giới hạn bộ đệm tiếng
+const MAX_AUDIO_BUFFER =
+  AUDIO_RATE * AUDIO_CHANNELS * 2 * MAX_BUFFER_MS / 1000;
+
+const AUDIO_CLIENT_TIMEOUT_MS = 3000;
 
 // Render
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu";
@@ -57,8 +64,16 @@ let videoFrameCount = 0;
 let lastVideoFrameAt = 0;
 let jpegPending = Buffer.alloc(0);
 
-let audioBuffer = Buffer.alloc(0);
+// Hàng đợi hình
+let videoQueue = [];
+let playbackFrame = null;
+let playbackFrameSeq = 0;
+
+// Hàng đợi tiếng
+let audioQueue = [];
+let audioQueuedBytes = 0;
 let audioRemainder = Buffer.alloc(0);
+
 let audioClient = null;
 let audioBlocked = false;
 
@@ -68,6 +83,7 @@ let ffmpegError = "";
 let audioDroppedBytes = 0;
 let audioSentFrames = 0;
 let videoDroppedClients = 0;
+let videoDroppedFrames = 0;
 
 // ==================== M3U ====================
 
@@ -172,6 +188,21 @@ async function loadChannels() {
   return channels.length;
 }
 
+// ==================== XÓA BỘ ĐỆM ====================
+
+function clearVideoBuffer() {
+  videoQueue = [];
+  playbackFrame = null;
+}
+
+function clearAudioBuffer() {
+  audioDroppedBytes += audioQueuedBytes;
+
+  audioQueue = [];
+  audioQueuedBytes = 0;
+  audioRemainder = Buffer.alloc(0);
+}
+
 // ==================== VIDEO JPEG PARSER ====================
 
 function processVideoData(chunk) {
@@ -229,42 +260,67 @@ function processVideoData(chunk) {
     const frameLength = end + 2;
 
     if (frameLength <= MAX_JPEG_BYTES) {
-      // Luôn thay bằng frame mới nhất
-      latestFrame = Buffer.from(
+      const frame = Buffer.from(
         jpegPending.subarray(0, frameLength)
       );
 
+      latestFrame = frame;
       videoFrameCount++;
       lastVideoFrameAt = Date.now();
+
+      // Chỉ xếp hàng khi có người xem
+      if (videoClients > 0) {
+        videoQueue.push({
+          data: frame,
+          readyAt: Date.now() + BUFFER_DELAY_MS
+        });
+
+        // Giới hạn hàng đợi hình
+        while (videoQueue.length > MAX_VIDEO_QUEUE_FRAMES) {
+          videoQueue.shift();
+          videoDroppedFrames++;
+        }
+      }
     }
 
     jpegPending = jpegPending.subarray(frameLength);
   }
 }
 
-// ==================== AUDIO LIVE BUFFER ====================
+// ==================== AUDIO BUFFER ====================
 
-function clearAudioBuffer() {
-  audioDroppedBytes += audioBuffer.length;
+function dropOldestAudioBytes(bytesToDrop) {
+  let remaining = bytesToDrop;
 
-  audioBuffer = Buffer.alloc(0);
-  audioRemainder = Buffer.alloc(0);
+  while (remaining > 0 && audioQueue.length > 0) {
+    const item = audioQueue[0];
+    const available = item.data.length - item.offset;
+
+    const remove = Math.min(available, remaining);
+
+    item.offset += remove;
+    audioQueuedBytes -= remove;
+    audioDroppedBytes += remove;
+    remaining -= remove;
+
+    if (item.offset >= item.data.length) {
+      audioQueue.shift();
+    }
+  }
 }
-
-// Không lưu audio khi không có client.
-// Không lưu dữ liệu trong lúc client đang nghẽn.
 
 function processAudioData(chunk) {
   if (!chunk || !chunk.length) return;
 
-  if (!audioClient || audioClient.destroyed || audioBlocked) {
+  // Không giữ tiếng khi chưa có người nghe
+  if (!audioClient || audioClient.destroyed) {
     audioDroppedBytes += chunk.length;
     return;
   }
 
   let data = chunk;
 
-  // Xử lý PCM 16-bit nếu chunk bị chia lẻ byte
+  // Giữ lại byte lẻ để bảo đảm PCM 16-bit
   if (audioRemainder.length) {
     data = Buffer.concat([audioRemainder, chunk]);
     audioRemainder = Buffer.alloc(0);
@@ -280,44 +336,96 @@ function processAudioData(chunk) {
 
   if (!data.length) return;
 
-  audioBuffer = Buffer.concat([audioBuffer, data]);
+  audioQueue.push({
+    data: Buffer.from(data),
+    offset: 0,
+    readyAt: Date.now() + BUFFER_DELAY_MS
+  });
 
-  // Chỉ giữ phần dữ liệu mới nhất
-  if (audioBuffer.length > MAX_AUDIO_BUFFER) {
-    const removeBytes =
-      audioBuffer.length - MAX_AUDIO_BUFFER;
+  audioQueuedBytes += data.length;
 
-    const alignedRemoveBytes =
-      removeBytes + (removeBytes % 2);
+  // Giới hạn bộ đệm tiếng tối đa 4 giây
+  if (audioQueuedBytes > MAX_AUDIO_BUFFER) {
+    const excess = audioQueuedBytes - MAX_AUDIO_BUFFER;
 
-    audioDroppedBytes += alignedRemoveBytes;
+    const alignedExcess =
+      excess + (excess % 2);
 
-    audioBuffer = audioBuffer.subarray(
-      alignedRemoveBytes
-    );
+    dropOldestAudioBytes(alignedExcess);
   }
 }
 
-// Lấy một frame PCM.
-// Nếu thiếu dữ liệu thì lấp bằng silence (0),
-// không lặp lại mẫu âm thanh cũ.
+// Lấy PCM đã đủ thời gian đệm.
+// Phần thiếu được lấp bằng silence, không lặp âm thanh cũ.
 
 function getAudioFrame() {
+  const now = Date.now();
+
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES);
+  let written = 0;
 
-  const available = Math.min(
-    audioBuffer.length - (audioBuffer.length % 2),
-    AUDIO_FRAME_BYTES
-  );
+  while (
+    written < AUDIO_FRAME_BYTES &&
+    audioQueue.length > 0
+  ) {
+    const item = audioQueue[0];
 
-  if (available > 0) {
-    audioBuffer.copy(frame, 0, 0, available);
+    // Chưa đến thời gian phát
+    if (item.readyAt > now) break;
 
-    audioBuffer = audioBuffer.subarray(available);
+    const available = item.data.length - item.offset;
+
+    const needed = AUDIO_FRAME_BYTES - written;
+    const take = Math.min(available, needed);
+
+    item.data.copy(
+      frame,
+      written,
+      item.offset,
+      item.offset + take
+    );
+
+    item.offset += take;
+    written += take;
+    audioQueuedBytes -= take;
+
+    if (item.offset >= item.data.length) {
+      audioQueue.shift();
+    }
   }
 
+  // Chưa có dữ liệu đã sẵn sàng
+  if (written === 0) {
+    return null;
+  }
+
+  // Phần còn lại của frame đã là silence (0)
   return frame;
 }
+
+// ==================== VIDEO PLAYBACK CLOCK ====================
+
+// Phát hình theo tốc độ cố định.
+// Không phát dồn frame để bù dữ liệu bị trễ.
+
+setInterval(() => {
+  if (videoClients <= 0) {
+    videoQueue = [];
+    return;
+  }
+
+  if (videoQueue.length === 0) return;
+
+  const now = Date.now();
+
+  if (videoQueue[0].readyAt > now) return;
+
+  const item = videoQueue.shift();
+
+  playbackFrame = item.data;
+  playbackFrameSeq++;
+
+}, Math.floor(1000 / VIDEO_FPS));
 
 // ==================== DỪNG FFMPEG ====================
 
@@ -334,6 +442,7 @@ function stopFFmpeg() {
   latestFrame = null;
   jpegPending = Buffer.alloc(0);
 
+  clearVideoBuffer();
   clearAudioBuffer();
 
   audioBlocked = false;
@@ -374,8 +483,7 @@ function startFFmpeg(channel) {
 
     "-i", channel.url,
 
-    // ================= VIDEO =================
-
+    // VIDEO
     "-map", "0:v:0?",
 
     "-vf",
@@ -389,8 +497,7 @@ function startFFmpeg(channel) {
     "-flush_packets", "1",
     "pipe:1",
 
-    // ================= AUDIO =================
-
+    // AUDIO
     "-map", "0:a:0?",
     "-vn",
 
@@ -471,6 +578,12 @@ app.get("/stream", (req, res) => {
 
   res.flushHeaders?.();
 
+  // Khi có người xem mới, bắt đầu đệm lại từ đầu
+  if (videoClients === 0) {
+    clearVideoBuffer();
+    playbackFrameSeq = 0;
+  }
+
   videoClients++;
 
   let closed = false;
@@ -483,15 +596,13 @@ app.get("/stream", (req, res) => {
       return;
     }
 
-    // Client đang nghẽn
     if (res.writableNeedDrain) {
       if (!blockedSince) {
         blockedSince = Date.now();
       }
 
       if (
-        Date.now() - blockedSince >
-        VIDEO_CLIENT_TIMEOUT_MS
+        Date.now() - blockedSince > VIDEO_CLIENT_TIMEOUT_MS
       ) {
         videoDroppedClients++;
         cleanup();
@@ -503,21 +614,18 @@ app.get("/stream", (req, res) => {
 
     blockedSince = 0;
 
-    if (
-      res.writableLength > MAX_VIDEO_CLIENT_BUFFER
-    ) {
+    if (res.writableLength > MAX_VIDEO_CLIENT_BUFFER) {
       videoDroppedClients++;
       cleanup();
       res.destroy();
       return;
     }
 
-    if (!latestFrame) return;
+    if (!playbackFrame) return;
 
-    if (lastSentFrame === videoFrameCount) return;
+    if (lastSentFrame === playbackFrameSeq) return;
 
-    // Luôn gửi frame mới nhất, bỏ qua frame cũ
-    const frame = latestFrame;
+    const frame = playbackFrame;
 
     const header = Buffer.from(
       `--frame\r\n` +
@@ -531,7 +639,7 @@ app.get("/stream", (req, res) => {
       Buffer.from("\r\n")
     ]);
 
-    lastSentFrame = videoFrameCount;
+    lastSentFrame = playbackFrameSeq;
 
     const accepted = res.write(packet);
 
@@ -549,6 +657,10 @@ app.get("/stream", (req, res) => {
     clearInterval(timer);
 
     videoClients = Math.max(0, videoClients - 1);
+
+    if (videoClients === 0) {
+      clearVideoBuffer();
+    }
   }
 
   res.on("close", cleanup);
@@ -563,9 +675,7 @@ app.get("/audio", (req, res) => {
     audioClient.destroy();
   }
 
-  // Không phát lại dữ liệu của phiên trước
   clearAudioBuffer();
-
   audioBlocked = false;
 
   res.status(200);
@@ -585,15 +695,11 @@ app.get("/audio", (req, res) => {
   let closed = false;
   let blockedSince = 0;
 
-  // Khi socket sẵn sàng trở lại,
-  // bỏ dữ liệu cũ và chỉ nhận dữ liệu mới.
   res.on("drain", () => {
     if (closed) return;
 
-    clearAudioBuffer();
-
-    audioBlocked = false;
     blockedSince = 0;
+    audioBlocked = false;
   });
 
   const timer = setInterval(() => {
@@ -602,20 +708,17 @@ app.get("/audio", (req, res) => {
       return;
     }
 
-    // Client không đọc kịp
+    // Không xóa bộ đệm chỉ vì socket vừa nghẽn.
+    // Để dữ liệu chờ trong giới hạn 4 giây.
     if (res.writableNeedDrain) {
       audioBlocked = true;
-
-      // Không giữ dữ liệu audio tồn đọng
-      clearAudioBuffer();
 
       if (!blockedSince) {
         blockedSince = Date.now();
       }
 
       if (
-        Date.now() - blockedSince >
-        AUDIO_CLIENT_TIMEOUT_MS
+        Date.now() - blockedSince > AUDIO_CLIENT_TIMEOUT_MS
       ) {
         cleanup();
         res.destroy();
@@ -624,15 +727,19 @@ app.get("/audio", (req, res) => {
       return;
     }
 
-    if (
-      res.writableLength > AUDIO_FRAME_BYTES * 2
-    ) {
+    if (res.writableLength > AUDIO_FRAME_BYTES * 4) {
       audioBlocked = true;
 
-      clearAudioBuffer();
+      if (!blockedSince) {
+        blockedSince = Date.now();
+      }
 
-      cleanup();
-      res.destroy();
+      if (
+        Date.now() - blockedSince > AUDIO_CLIENT_TIMEOUT_MS
+      ) {
+        cleanup();
+        res.destroy();
+      }
 
       return;
     }
@@ -640,9 +747,10 @@ app.get("/audio", (req, res) => {
     blockedSince = 0;
     audioBlocked = false;
 
-    // Không có dữ liệu thì phát silence,
-    // không phát lại dữ liệu cũ.
     const frame = getAudioFrame();
+
+    // Chưa có dữ liệu đã qua thời gian đệm
+    if (!frame) return;
 
     const accepted = res.write(frame);
 
@@ -650,7 +758,6 @@ app.get("/audio", (req, res) => {
 
     if (!accepted) {
       audioBlocked = true;
-      clearAudioBuffer();
       blockedSince = Date.now();
     }
 
@@ -665,9 +772,7 @@ app.get("/audio", (req, res) => {
 
     if (audioClient === res) {
       audioClient = null;
-
       audioBlocked = false;
-
       clearAudioBuffer();
     }
   }
@@ -789,6 +894,11 @@ app.get("/health", (req, res) => {
       ? ffmpegProcess.pid
       : null,
 
+    buffer: {
+      targetDelayMs: BUFFER_DELAY_MS,
+      maxBufferMs: MAX_BUFFER_MS
+    },
+
     video: {
       width: VIDEO_WIDTH,
       height: VIDEO_HEIGHT,
@@ -796,26 +906,28 @@ app.get("/health", (req, res) => {
       frameCount: videoFrameCount,
       frameAgeMs: frameAge,
       pendingBytes: jpegPending.length,
+      queuedFrames: videoQueue.length,
+      queuedMs: Math.round(
+        videoQueue.length / VIDEO_FPS * 1000
+      ),
       clients: videoClients,
-      droppedClients: videoDroppedClients
+      droppedClients: videoDroppedClients,
+      droppedFrames: videoDroppedFrames
     },
 
     audio: {
       sampleRate: AUDIO_RATE,
       channels: AUDIO_CHANNELS,
       frameMs: AUDIO_FRAME_MS,
-      bufferBytes: audioBuffer.length,
+      bufferBytes: audioQueuedBytes,
 
       bufferMs: Math.round(
-        audioBuffer.length / (AUDIO_RATE * 2) * 1000
+        audioQueuedBytes / (AUDIO_RATE * 2) * 1000
       ),
 
       connected: !!audioClient,
-
       blocked: audioBlocked,
-
       droppedBytes: audioDroppedBytes,
-
       sentFrames: audioSentFrames
     },
 
@@ -948,7 +1060,9 @@ async function startServer() {
       `Audio: ${AUDIO_RATE}Hz / ${AUDIO_FRAME_MS}ms frames`
     );
 
-    console.log("Live buffer mode: ENABLED");
+    console.log(`A/V buffer delay: ${BUFFER_DELAY_MS}ms`);
+    console.log(`Maximum buffer: ${MAX_BUFFER_MS}ms`);
+    console.log("Buffered live mode: ENABLED");
   });
 }
 
