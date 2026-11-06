@@ -28,7 +28,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_RATE * AUDIO_CHANNELS * 2 * AUDIO_FRAME_MS / 1000;
 
 // Bộ đệm chung theo thời gian
-const BUFFER_DELAY_MS = 1500;
+const BUFFER_DELAY_MS = 3000;
 const MAX_BUFFER_MS = 4000;
 
 // Giới hạn bộ đệm hình
