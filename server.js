@@ -65,7 +65,7 @@ const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 // =====================================================
 
 // Không ghi API key trực tiếp vào source code.
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu";
 
 const RENDER_SERVICE_IDS = (
   process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
