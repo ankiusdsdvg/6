@@ -65,7 +65,7 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu ";
 const RENDER_SERVICE_IDS = (
   process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
 ).split(",").map(x => x.trim()).filter(Boolean);
