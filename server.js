@@ -30,7 +30,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 800;
+const AUDIO_START_BUFFER_MS = 1000;
 const AUDIO_BUFFER_MS = 3000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
@@ -39,9 +39,12 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 700;
-const AUDIO_TARGET_MAX_MS = 1400;
+const AUDIO_TARGET_MIN_MS = 800;
+const AUDIO_TARGET_MAX_MS = 1600;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
+
+// Ngưỡng drop khi buffer tích tụ quá lớn (gấp đôi target)
+const AUDIO_OVERFLOW_FACTOR = 2;
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
@@ -83,7 +86,6 @@ let videoInvalidFrames = 0;
 let videoSentFrames = 0;
 let videoClients = 0;
 
-// Map: res -> { blocked, blockedSince, lastSentSequence }
 const videoClientsMap = new Map();
 
 let audioBuffer = Buffer.alloc(0);
@@ -93,6 +95,7 @@ let audioBlocked = false;
 let audioBlockedSince = 0;
 let audioUnderflows = 0;
 let audioOverflowBytes = 0;
+let audioAdaptiveDrops = 0;
 let audioFramesSent = 0;
 let audioSilenceSent = 0;
 let audioPrimed = false;
@@ -209,6 +212,7 @@ function resetAudioState(resetStats = false) {
   if (resetStats) {
     audioUnderflows = 0;
     audioOverflowBytes = 0;
+    audioAdaptiveDrops = 0;
     audioFramesSent = 0;
     audioSilenceSent = 0;
     audioSilenceBytes = 0;
@@ -371,6 +375,7 @@ function writeAudioFrame(frame, isSilence = false) {
   }
 }
 
+// 🔥 Audio tick với adaptive drop — bắt kịp khi buffer tích tụ
 function audioTick() {
   if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
     disconnectAudioClient();
@@ -395,13 +400,27 @@ function audioTick() {
 
   const framesToSend = Math.max(1, Math.round(elapsed / AUDIO_INTERVAL));
 
+  const targetBytes = Math.floor(
+    AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE *
+    audioTargetBufferMs / 1000
+  );
+
+  // Adaptive drop: nếu buffer tích tụ > factor × target → bỏ frame cũ để bắt kịp
+  if (audioPrimed && audioBuffer.length > targetBytes * AUDIO_OVERFLOW_FACTOR) {
+    const dropBytes = (audioBuffer.length - targetBytes) & ~1;
+
+    audioBuffer = audioBuffer.subarray(dropBytes);
+    audioOverflowBytes += dropBytes;
+    audioAdaptiveDrops++;
+
+    console.warn(
+      "[AUDIO] Buffer overflow: dropped", dropBytes, "bytes (buffer:",
+      audioBuffer.length, "target:", targetBytes, ")"
+    );
+  }
+
   for (let i = 0; i < framesToSend; i++) {
     if (!audioPrimed) {
-      const targetBytes = Math.floor(
-        AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE *
-        audioTargetBufferMs / 1000
-      );
-
       if (audioBuffer.length < targetBytes) {
         if (!writeAudioFrame(makeSilenceFrame(), true)) return;
         continue;
@@ -588,7 +607,6 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
-    // Không throttle, broadcast ngay mỗi frame
     broadcastFrame(latestFrame);
 
     jpegPending = jpegPending.subarray(frameLength);
@@ -669,7 +687,6 @@ function startFFmpeg(channel) {
   console.log("MODE: -re input realtime, -r output CFR");
   console.log("==================================");
 
-  // BỎ filter fps=8 — để output -r lo
   const videoFilter = [
     `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
     `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
@@ -688,10 +705,10 @@ function startFFmpeg(channel) {
     "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
-    "-re",                          // Đọc input realtime
+    "-re",
     "-i", channel.url,
 
-    // OUTPUT 1: MJPEG VIDEO — ép 8fps output
+    // OUTPUT 1: MJPEG VIDEO
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
@@ -1218,7 +1235,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_MJPEG_PCM_RE_INPUT",
+    pipeline: "REALTIME_MJPEG_PCM_ADAPTIVE_SYNC",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1248,9 +1265,16 @@ app.get("/health", (req, res) => {
     audioBlocked,
     audioUnderflows,
     audioOverflowBytes,
+    audioAdaptiveDrops,
     audioSilenceBytes,
     audioFramesSent,
     audioSilenceSent,
+
+    audioBufferMs: Number(
+      (audioBuffer.length /
+        (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE) * 1000
+      ).toFixed(1)
+    ),
 
     memory: {
       rssMB: Number((memory.rss / 1048576).toFixed(2)),
@@ -1269,7 +1293,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - REALTIME MJPEG + PCM (-re input)");
+  res.send("IPTV SERVER RUNNING - ADAPTIVE SYNC MJPEG + PCM");
 });
 
 async function main() {
@@ -1287,7 +1311,9 @@ async function main() {
     console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
     console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
-    console.log("PIPELINE: REALTIME MJPEG + PCM (-re input)");
+    console.log("AUDIO TARGET:", `${AUDIO_TARGET_MIN_MS}-${AUDIO_TARGET_MAX_MS}ms`);
+    console.log("AUDIO OVERFLOW FACTOR:", AUDIO_OVERFLOW_FACTOR);
+    console.log("PIPELINE: ADAPTIVE SYNC MJPEG + PCM");
     console.log("BANDWIDTH API: /api/bandwidth");
     console.log("HEALTH API: /health");
     console.log("--------------------------------");
