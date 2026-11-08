@@ -21,7 +21,7 @@ const VIDEO_FPS = 12;              // FPS tối đa FFmpeg encode
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-const JPEG_QUALITY = 20;
+const JPEG_QUALITY = 15;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -57,7 +57,7 @@ const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 
 // 🔥 TỰ PHỤC HỒI CLIENT
-const CLIENT_SKIP_THRESHOLD_MS = 300;   // block > 300ms → bỏ frame
+const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
 const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
 
 const MAX_AUDIO_BLOCK_MS = 1500;
