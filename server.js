@@ -20,7 +20,6 @@ const VIDEO_HEIGHT = 180;
 const VIDEO_FPS = 8;
 const JPEG_QUALITY = 8;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
-const BROADCAST_MIN_INTERVAL = Math.floor(VIDEO_INTERVAL * 0.85); // ~106ms
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
@@ -31,7 +30,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 500;
+const AUDIO_START_BUFFER_MS = 800;
 const AUDIO_BUFFER_MS = 3000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
@@ -40,8 +39,8 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 500;
-const AUDIO_TARGET_MAX_MS = 1200;
+const AUDIO_TARGET_MIN_MS = 700;
+const AUDIO_TARGET_MAX_MS = 1400;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
 const DECODER_THREADS = 2;
@@ -76,8 +75,6 @@ let ffmpeg = null;
 let generation = 0;
 
 let latestFrame = null;
-let latestFrameBroadcasted = false;
-let lastBroadcastTime = 0;
 let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
@@ -374,7 +371,6 @@ function writeAudioFrame(frame, isSilence = false) {
   }
 }
 
-// Tick audio: gửi đủ số frame theo elapsed (deadline tuyệt đối)
 function audioTick() {
   if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
     disconnectAudioClient();
@@ -407,7 +403,6 @@ function audioTick() {
       );
 
       if (audioBuffer.length < targetBytes) {
-        // Gửi silence để giữ kết nối sống trong lúc chờ prebuffer
         if (!writeAudioFrame(makeSilenceFrame(), true)) return;
         continue;
       }
@@ -456,8 +451,6 @@ function startAudioTimer() {
 function clearVideoBuffer() {
   jpegPending = Buffer.alloc(0);
   latestFrame = null;
-  latestFrameBroadcasted = false;
-  lastBroadcastTime = 0;
   frameSequence = 0;
 }
 
@@ -588,11 +581,6 @@ function processVideoData(chunk, currentGeneration) {
       continue;
     }
 
-    // Chỉ đếm frame bị bỏ khi frame cũ chưa kịp broadcast
-    if (latestFrame && !latestFrameBroadcasted) {
-      videoDroppedFrames++;
-    }
-
     latestFrame = Buffer.from(
       jpegPending.subarray(0, frameLength)
     );
@@ -600,15 +588,8 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
-    // Throttle wallclock: chỉ broadcast tối đa ~8fps
-    const now = Date.now();
-    if (now - lastBroadcastTime >= BROADCAST_MIN_INTERVAL) {
-      lastBroadcastTime = now;
-      broadcastFrame(latestFrame);
-      latestFrameBroadcasted = true;
-    } else {
-      latestFrameBroadcasted = false;
-    }
+    // Không throttle, broadcast ngay mỗi frame
+    broadcastFrame(latestFrame);
 
     jpegPending = jpegPending.subarray(frameLength);
   }
@@ -685,10 +666,11 @@ function startFFmpeg(channel) {
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
+  console.log("MODE: -re input realtime, -r output CFR");
   console.log("==================================");
 
+  // BỎ filter fps=8 — để output -r lo
   const videoFilter = [
-    `fps=${VIDEO_FPS}:round=near`,
     `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
     `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
     "setsar=1"
@@ -706,17 +688,18 @@ function startFFmpeg(channel) {
     "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
+    "-re",                          // Đọc input realtime
     "-i", channel.url,
 
-    // OUTPUT 1: MJPEG VIDEO
+    // OUTPUT 1: MJPEG VIDEO — ép 8fps output
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
     "-c:v", "mjpeg",
     "-q:v", String(JPEG_QUALITY),
     "-threads", String(ENCODER_THREADS),
-    "-fps_mode", "cfr",
     "-r", String(VIDEO_FPS),
+    "-fps_mode", "cfr",
     "-flush_packets", "1",
     "-f", "image2pipe",
     "pipe:1",
@@ -828,7 +811,7 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM - EVENT-DRIVEN MJPEG
+// VIDEO STREAM
 // =====================================================
 
 app.get("/stream", (req, res) => {
@@ -851,7 +834,6 @@ app.get("/stream", (req, res) => {
 
   videoClientsMap.set(res, state);
 
-  // Gửi frame hiện tại ngay nếu có và còn tươi
   if (
     latestFrame &&
     Date.now() - lastVideoFrameTime <= 1500 &&
@@ -879,7 +861,7 @@ app.get("/stream", (req, res) => {
 });
 
 // =====================================================
-// AUDIO STREAM - RAW PCM
+// AUDIO STREAM
 // =====================================================
 
 app.get("/audio", (req, res) => {
@@ -941,10 +923,7 @@ app.get("/api/channels", (req, res) => {
 
   const filtered = filterChannelsByResolution(channels, maxResolution);
 
-  const resetSeconds = Math.max(
-    3,
-    Math.ceil(RESTART_DELAY / 1000)
-  );
+  const resetSeconds = Math.max(3, Math.ceil(RESTART_DELAY / 1000));
 
   res.json({
     success: true,
@@ -1239,12 +1218,11 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "EVENT_DRIVEN_MJPEG_PCM_THROTTLED",
+    pipeline: "REALTIME_MJPEG_PCM_RE_INPUT",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
-    videoBroadcastInterval: BROADCAST_MIN_INTERVAL,
     videoDroppedFrames,
     videoInvalidFrames,
     videoSentFrames,
@@ -1254,9 +1232,6 @@ app.get("/health", (req, res) => {
     videoFrameSequence: frameSequence,
     videoFrameAge: lastVideoFrameTime
       ? Date.now() - lastVideoFrameTime
-      : null,
-    videoLastBroadcastAgo: lastBroadcastTime
-      ? Date.now() - lastBroadcastTime
       : null,
 
     audioSampleRate: AUDIO_SAMPLE_RATE,
@@ -1294,7 +1269,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - THROTTLED MJPEG + PCM");
+  res.send("IPTV SERVER RUNNING - REALTIME MJPEG + PCM (-re input)");
 });
 
 async function main() {
@@ -1310,10 +1285,9 @@ async function main() {
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
     console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
-    console.log("BROADCAST MIN INTERVAL:", BROADCAST_MIN_INTERVAL, "ms");
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
     console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
-    console.log("PIPELINE: THROTTLED MJPEG + PCM ADAPTIVE BUFFER");
+    console.log("PIPELINE: REALTIME MJPEG + PCM (-re input)");
     console.log("BANDWIDTH API: /api/bandwidth");
     console.log("HEALTH API: /health");
     console.log("--------------------------------");
