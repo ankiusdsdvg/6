@@ -24,19 +24,27 @@ const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
-
-// Giữ nguyên kích thước gói âm thanh 200 ms để tương thích firmware hiện tại.
 const AUDIO_FRAME_MS = 200;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-// Buffer ngắn để giảm độ trễ. Khi đầy sẽ bỏ dữ liệu PCM cũ nhất.
-const AUDIO_BUFFER_MS = 400;
+// Buffer starts only after 1.2s of PCM is available.
+// The queue can grow to 3s to absorb short source/network jitter.
+const AUDIO_START_BUFFER_MS = 1200;
+const AUDIO_BUFFER_MS = 3000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_BUFFER_MS / 1000;
+
+// Adaptive prebuffer target: rises after underruns and slowly falls
+// after a long stable period. It never changes the firmware packet size.
+let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
+let audioStableFrames = 0;
+const AUDIO_TARGET_MIN_MS = 1000;
+const AUDIO_TARGET_MAX_MS = 1800;
+const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
@@ -53,8 +61,6 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-// Render API key phải đặt trong Environment: RENDER_API_KEY.
-// Không nhúng key bí mật vào source code.
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
 const RENDER_SERVICE_IDS = (
   process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
@@ -87,6 +93,10 @@ let audioBlockedSince = 0;
 let audioUnderflows = 0;
 let audioOverflowBytes = 0;
 let audioFramesSent = 0;
+let audioPrimed = false;
+let audioSilenceBytes = 0;
+let audioLastTick = 0;
+let audioMaxObservedBytes = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -176,11 +186,28 @@ async function loadChannels() {
 }
 
 // =====================================================
-// AUDIO BUFFER
+// AUDIO BUFFER / CLOCK
 // =====================================================
+
+function resetAudioState(resetStats = false) {
+  audioBuffer = Buffer.alloc(0);
+  audioPrimed = false;
+  audioStableFrames = 0;
+  audioTargetBufferMs = AUDIO_START_BUFFER_MS;
+  audioLastTick = 0;
+  audioMaxObservedBytes = 0;
+
+  if (resetStats) {
+    audioUnderflows = 0;
+    audioOverflowBytes = 0;
+    audioFramesSent = 0;
+    audioSilenceBytes = 0;
+  }
+}
 
 function clearAudioBuffer() {
   audioBuffer = Buffer.alloc(0);
+  audioPrimed = false;
 }
 
 function disconnectAudioClient() {
@@ -200,60 +227,49 @@ function disconnectAudioClient() {
   }
 }
 
-// PCM is a byte stream. Keep sample alignment and discard OLDEST
-// samples on overflow so latency cannot grow indefinitely.
+// Do not queue PCM when nobody is listening. This prevents the server
+// from overflowing its queue while ESP32 is disconnected.
 function pushAudioBuffer(chunk) {
-  if (!chunk || !chunk.length) return;
+  if (!audioClient || audioClient.destroyed || !chunk?.length) return;
 
   if (chunk.length & 1) chunk = chunk.subarray(0, chunk.length - 1);
   if (!chunk.length) return;
 
-  if (chunk.length >= AUDIO_BUFFER_MAX) {
-    audioOverflowBytes += audioBuffer.length +
-      (chunk.length - AUDIO_BUFFER_MAX);
-    audioBuffer = Buffer.from(
-      chunk.subarray(chunk.length - AUDIO_BUFFER_MAX)
-    );
-    return;
-  }
-
   const total = audioBuffer.length + chunk.length;
-  if (total <= AUDIO_BUFFER_MAX) {
+  if (total > AUDIO_BUFFER_MAX) {
+    const excess = total - AUDIO_BUFFER_MAX;
+    const drop = excess + (excess & 1);
+    audioOverflowBytes += drop;
+
+    if (drop >= audioBuffer.length) {
+      const fromChunk = Math.min(chunk.length, AUDIO_BUFFER_MAX);
+      audioBuffer = Buffer.from(chunk.subarray(chunk.length - fromChunk));
+    } else {
+      const keepOld = audioBuffer.subarray(drop);
+      audioBuffer = Buffer.concat([keepOld, chunk]);
+    }
+  } else {
     audioBuffer = audioBuffer.length
       ? Buffer.concat([audioBuffer, chunk], total)
       : Buffer.from(chunk);
-    return;
-  }
-
-  const excess = total - AUDIO_BUFFER_MAX;
-  audioOverflowBytes += excess;
-
-  // Drop oldest bytes; keep 16-bit sample alignment.
-  const drop = excess + (excess & 1);
-  const oldKeep = Math.max(0, audioBuffer.length - drop);
-
-  if (oldKeep > 0) {
-    audioBuffer = Buffer.concat([
-      audioBuffer.subarray(audioBuffer.length - oldKeep),
-      chunk
-    ]);
-  } else {
-    const fromChunk = Math.min(chunk.length, AUDIO_BUFFER_MAX);
-    audioBuffer = Buffer.from(chunk.subarray(chunk.length - fromChunk));
   }
 
   if (audioBuffer.length > AUDIO_BUFFER_MAX) {
-    audioBuffer = audioBuffer.subarray(
-      audioBuffer.length - AUDIO_BUFFER_MAX
-    );
+    audioBuffer = Buffer.from(audioBuffer.subarray(-AUDIO_BUFFER_MAX));
   }
   if (audioBuffer.length & 1) {
-    audioBuffer = audioBuffer.subarray(1);
+    audioBuffer = Buffer.from(audioBuffer.subarray(1));
+  }
+
+  if (audioBuffer.length > audioMaxObservedBytes) {
+    audioMaxObservedBytes = audioBuffer.length;
   }
 }
 
-// Never repeat the last PCM sample. If FFmpeg has not supplied enough
-// audio, pad the remainder with digital silence (zero samples).
+function makeSilenceFrame() {
+  return Buffer.alloc(AUDIO_FRAME_BYTES, 0);
+}
+
 function takeAudioFrame() {
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
   const count = Math.min(audioBuffer.length, AUDIO_FRAME_BYTES) & ~1;
@@ -262,14 +278,37 @@ function takeAudioFrame() {
     audioBuffer.copy(frame, 0, 0, count);
     audioBuffer = audioBuffer.subarray(count);
   }
-  if (count < AUDIO_FRAME_BYTES) audioUnderflows++;
+
+  if (count < AUDIO_FRAME_BYTES) {
+    audioUnderflows++;
+    audioSilenceBytes += AUDIO_FRAME_BYTES - count;
+    audioStableFrames = 0;
+
+    // Increase startup reserve after an underrun, up to 1.8 seconds.
+    audioTargetBufferMs = Math.min(
+      AUDIO_TARGET_MAX_MS,
+      audioTargetBufferMs + 100
+    );
+  } else {
+    audioStableFrames++;
+    if (audioStableFrames >= AUDIO_STABLE_FRAMES_TO_REDUCE) {
+      audioTargetBufferMs = Math.max(
+        AUDIO_TARGET_MIN_MS,
+        audioTargetBufferMs - 50
+      );
+      audioStableFrames = 0;
+    }
+  }
+
   return frame;
 }
 
 function startAudioTimer() {
   if (audioTimer) clearInterval(audioTimer);
 
-  let nextTick = Date.now() + AUDIO_INTERVAL;
+  // Fixed packet cadence. setInterval is retained for compatibility with
+  // the existing raw PCM endpoint and 200ms firmware packet expectation.
+  audioLastTick = Date.now();
 
   audioTimer = setInterval(() => {
     if (!audioClient || audioClient.destroyed) {
@@ -285,11 +324,29 @@ function startAudioTimer() {
       return;
     }
 
-    // Use a fixed-rate sender. Do not burst old packets after a delayed tick.
     const now = Date.now();
-    if (now + 5 < nextTick) return;
-    nextTick += AUDIO_INTERVAL;
-    if (now - nextTick > AUDIO_INTERVAL) nextTick = now + AUDIO_INTERVAL;
+    const elapsed = now - audioLastTick;
+    audioLastTick = now;
+
+    // Do not send a burst to compensate for a delayed event-loop tick.
+    // A single packet is emitted per scheduled interval.
+    if (elapsed > AUDIO_INTERVAL * 2) {
+      console.warn("[AUDIO] Sender clock delayed:", elapsed, "ms");
+    }
+
+    const targetBytes = Math.floor(
+      AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
+      AUDIO_BYTES_PER_SAMPLE * audioTargetBufferMs / 1000
+    );
+
+    // Initial prebuffer: wait until 1.2s (adaptive 1.0-1.8s) is available.
+    // After playback has started, keep the clock running and use zero PCM
+    // for any missing tail; never repeat stale samples.
+    if (!audioPrimed) {
+      if (audioBuffer.length < targetBytes) return;
+      audioPrimed = true;
+      console.log("[AUDIO] Prebuffer ready:", audioBuffer.length, "bytes");
+    }
 
     const frame = takeAudioFrame();
 
@@ -309,7 +366,7 @@ function startAudioTimer() {
       console.error("[AUDIO WRITE]", error.message);
       disconnectAudioClient();
     }
-  }, Math.max(5, Math.floor(AUDIO_INTERVAL / 4)));
+  }, AUDIO_INTERVAL);
 }
 
 // =====================================================
@@ -374,7 +431,6 @@ function processVideoData(chunk, currentGeneration) {
       continue;
     }
 
-    // A new frame replaces an unsent old frame: latest-frame-wins.
     if (latestFrame) videoDroppedFrames++;
     latestFrame = Buffer.from(jpegPending.subarray(0, frameLength));
     frameSequence++;
@@ -427,23 +483,21 @@ function startFFmpeg(channel) {
   currentChannel = channel;
 
   clearVideoBuffer();
-  clearAudioBuffer();
+  resetAudioState(true);
 
   videoDroppedFrames = 0;
   videoInvalidFrames = 0;
   videoSentFrames = 0;
-  audioUnderflows = 0;
-  audioOverflowBytes = 0;
-  audioFramesSent = 0;
 
   const currentGeneration = generation;
   lastVideoFrameTime = Date.now();
 
-  console.log("\n==================================");
+  console.log("\\n==================================");
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
+  console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
   console.log("==================================");
 
   const videoFilter = [
@@ -457,14 +511,11 @@ function startFFmpeg(channel) {
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
-
     "-rw_timeout", "30000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-
-    // Keep source timestamps. Do NOT replace video PTS with N/(FPS*TB).
     "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
@@ -482,10 +533,10 @@ function startFFmpeg(channel) {
     "-f", "image2pipe",
     "pipe:1",
 
-    // OUTPUT 2: PCM audio. Resample timestamps and correct small clock drift.
+    // OUTPUT 2: PCM. Async resampling follows source timestamp drift.
     "-map", "0:a:0?",
     "-vn",
-    "-af", `aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0`,
+    "-af", `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.100:first_pts=0`,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
@@ -608,17 +659,16 @@ app.get("/stream", (req, res) => {
     const frame = latestFrame;
     const sequence = frameSequence;
     if (!frame || sequence === lastSentSequence) return;
-
     if (Date.now() - lastVideoFrameTime > 1500) return;
 
     const header = Buffer.from(
-      `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${frame.length}\r\n\r\n`
+      `--frame\\r\\nContent-Type: image/jpeg\\r\\nContent-Length: ${frame.length}\\r\\n\\r\\n`
     );
 
     try {
       let ok = res.write(header);
       if (!res.write(frame)) ok = false;
-      if (!res.write("\r\n")) ok = false;
+      if (!res.write("\\r\\n")) ok = false;
 
       lastSentSequence = sequence;
       videoSentFrames++;
@@ -631,7 +681,7 @@ app.get("/stream", (req, res) => {
           blockedSince = 0;
         });
       }
-    } catch (error) {
+    } catch (_) {
       cleanup();
       res.destroy();
     }
@@ -646,9 +696,8 @@ app.get("/stream", (req, res) => {
 // =====================================================
 
 app.get("/audio", (req, res) => {
-  // Keep the original one-audio-client behavior for firmware compatibility.
   disconnectAudioClient();
-  clearAudioBuffer();
+  resetAudioState(false);
 
   audioClient = res;
   res.statusCode = 200;
@@ -658,7 +707,7 @@ app.get("/audio", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  console.log("[AUDIO] Client connected");
+  console.log("[AUDIO] Client connected; waiting for PCM prebuffer");
   startAudioTimer();
 
   res.on("close", () => {
@@ -877,7 +926,7 @@ app.get("/health", (req, res) => {
     ffmpegRunning: !!ffmpeg,
     restarting,
     manuallyStopped,
-    pipeline: "REALTIME_MJPEG_PCM_LOW_LATENCY",
+    pipeline: "REALTIME_MJPEG_PCM_ADAPTIVE_BUFFER",
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
@@ -895,10 +944,15 @@ app.get("/health", (req, res) => {
     audioInterval: AUDIO_INTERVAL,
     audioBufferBytes: audioBuffer.length,
     audioBufferMax: AUDIO_BUFFER_MAX,
+    audioStartBufferMs: AUDIO_START_BUFFER_MS,
+    audioTargetBufferMs,
+    audioPrimed,
+    audioMaxObservedBytes,
     audioClientConnected: !!audioClient && !audioClient.destroyed,
     audioBlocked,
     audioUnderflows,
     audioOverflowBytes,
+    audioSilenceBytes,
     audioFramesSent,
     memory: {
       rssMB: Number((memory.rss / 1048576).toFixed(2)),
@@ -933,7 +987,8 @@ async function main() {
     console.log("CHANNELS:", channels.length);
     console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-    console.log("PIPELINE: REALTIME MJPEG + PCM");
+    console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
+    console.log("PIPELINE: REALTIME MJPEG + PCM ADAPTIVE BUFFER");
     console.log("BANDWIDTH API: /api/bandwidth");
     console.log("HEALTH API: /health");
     console.log("--------------------------------");
