@@ -30,7 +30,6 @@ const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-// Giảm prebuffer/target để audio gần hình hơn
 const AUDIO_START_BUFFER_MS = 500;
 const AUDIO_BUFFER_MS = 2000;
 const AUDIO_BUFFER_MAX =
@@ -44,11 +43,13 @@ const AUDIO_TARGET_MIN_MS = 400;
 const AUDIO_TARGET_MAX_MS = 800;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 100;
 
-// Drift tối đa: nếu buffer vượt target + drift → drop để bắt kịp
 const AUDIO_MAX_DRIFT_MS = 400;
-
-// Ngưỡng drop khẩn cấp (factor × target)
 const AUDIO_OVERFLOW_FACTOR = 1.5;
+
+// A/V sync: nếu lệch > ngưỡng này → cưỡng bức đồng bộ
+const AV_SYNC_THRESHOLD_MS = 500;
+// Chỉ chạy sync guard sau khi đã ổn định ít nhất 3s
+const AV_SYNC_MIN_RUNTIME_MS = 3000;
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
@@ -57,7 +58,6 @@ const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-// Ngưỡng đếm lỗi PPS
 const PPS_ERROR_WINDOW_MS = 10000;
 const PPS_ERROR_THRESHOLD = 20;
 
@@ -104,12 +104,17 @@ let audioBlockedSince = 0;
 let audioUnderflows = 0;
 let audioOverflowBytes = 0;
 let audioAdaptiveDrops = 0;
+let audioSyncDrops = 0;
+let audioSyncInserts = 0;
 let audioFramesSent = 0;
 let audioSilenceSent = 0;
 let audioPrimed = false;
 let audioSilenceBytes = 0;
 let audioLastTick = 0;
 let audioMaxObservedBytes = 0;
+
+// A/V sync anchor: thời điểm bắt đầu đo sync
+let avSyncAnchorTime = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -219,11 +224,14 @@ function resetAudioState(resetStats = false) {
   audioTargetBufferMs = AUDIO_START_BUFFER_MS;
   audioLastTick = 0;
   audioMaxObservedBytes = 0;
+  avSyncAnchorTime = Date.now();
 
   if (resetStats) {
     audioUnderflows = 0;
     audioOverflowBytes = 0;
     audioAdaptiveDrops = 0;
+    audioSyncDrops = 0;
+    audioSyncInserts = 0;
     audioFramesSent = 0;
     audioSilenceSent = 0;
     audioSilenceBytes = 0;
@@ -386,6 +394,27 @@ function writeAudioFrame(frame, isSilence = false) {
   }
 }
 
+// Trả về độ lệch sync (audio chậm hơn video: âm, nhanh hơn: dương)
+function computeAvSyncDiffMs() {
+  if (avSyncAnchorTime <= 0) return 0;
+
+  const elapsedMs = Date.now() - avSyncAnchorTime;
+
+  if (elapsedMs < AV_SYNC_MIN_RUNTIME_MS) return 0;
+
+  // Số frame audio đáng lẽ phải gửi trong elapsedMs
+  const expectedAudioFrames = Math.floor(elapsedMs / AUDIO_INTERVAL);
+
+  // Số frame audio đã gửi thực tế (audio + silence)
+  const actualAudioFrames = audioFramesSent + audioSilenceSent;
+
+  // Nếu audio đã gửi > expected → audio nhanh hơn (dương)
+  // Nếu audio đã gửi < expected → audio chậm hơn (âm)
+  const diffFrames = actualAudioFrames - expectedAudioFrames;
+
+  return diffFrames * AUDIO_INTERVAL;
+}
+
 function audioTick() {
   if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
     disconnectAudioClient();
@@ -420,7 +449,7 @@ function audioTick() {
     AUDIO_MAX_DRIFT_MS / 1000
   );
 
-  // Drop khi buffer vượt target + drift (giữ audio gần hình)
+  // Drop khi buffer vượt target + drift
   if (audioPrimed && audioBuffer.length > targetBytes + driftBytes) {
     const dropBytes = (audioBuffer.length - targetBytes) & ~1;
 
@@ -434,7 +463,7 @@ function audioTick() {
     );
   }
 
-  // Drop khẩn cấp nếu buffer > factor × target
+  // Drop khẩn cấp
   if (
     audioPrimed &&
     audioBuffer.length > targetBytes * AUDIO_OVERFLOW_FACTOR + driftBytes
@@ -450,6 +479,43 @@ function audioTick() {
     );
   }
 
+  // A/V sync guard: so sánh frame audio đã gửi với wall-clock
+  if (audioPrimed) {
+    const diff = computeAvSyncDiffMs();
+
+    if (diff < -AV_SYNC_THRESHOLD_MS) {
+      // Audio chậm hơn video → chèn silence để bắt kịp
+      const framesToInsert = Math.min(
+        Math.ceil(-diff / AUDIO_INTERVAL),
+        10
+      );
+
+      console.warn(
+        "[SYNC] Audio behind by", diff, "ms — inserting",
+        framesToInsert, "silence frames"
+      );
+
+      for (let i = 0; i < framesToInsert; i++) {
+        if (!writeAudioFrame(makeSilenceFrame(), true)) break;
+        audioSyncInserts++;
+      }
+    } else if (diff > AV_SYNC_THRESHOLD_MS) {
+      // Audio nhanh hơn video → drop audio buffer
+      const framesToDrop = Math.ceil(diff / AUDIO_INTERVAL);
+      const dropBytes = (framesToDrop * AUDIO_FRAME_BYTES) & ~1;
+
+      if (audioBuffer.length >= dropBytes) {
+        audioBuffer = audioBuffer.subarray(dropBytes);
+        audioSyncDrops++;
+
+        console.warn(
+          "[SYNC] Audio ahead by", diff, "ms — dropped",
+          dropBytes, "bytes"
+        );
+      }
+    }
+  }
+
   for (let i = 0; i < framesToSend; i++) {
     if (!audioPrimed) {
       if (audioBuffer.length < targetBytes) {
@@ -458,6 +524,8 @@ function audioTick() {
       }
 
       audioPrimed = true;
+      avSyncAnchorTime = Date.now();
+
       console.log("[AUDIO] Prebuffer ready:", audioBuffer.length, "bytes");
     }
 
@@ -719,8 +787,8 @@ function startFFmpeg(channel) {
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
   console.log("AUDIO TARGET:", `${AUDIO_TARGET_MIN_MS}-${AUDIO_TARGET_MAX_MS}ms`);
-  console.log("AUDIO MAX DRIFT:", `${AUDIO_MAX_DRIFT_MS}ms`);
-  console.log("MODE: -re input, -r output, adaptive sync");
+  console.log("AV SYNC THRESHOLD:", `${AV_SYNC_THRESHOLD_MS}ms`);
+  console.log("MODE: -re input, -r output, -async 1, sync guard");
   console.log("==================================");
 
   const videoFilter = [
@@ -744,6 +812,7 @@ function startFFmpeg(channel) {
     "-filter_threads", "1",
     "-re",
     "-i", channel.url,
+    "-async", "1",
 
     // OUTPUT 1: MJPEG VIDEO
     "-map", "0:v:0?",
@@ -758,10 +827,10 @@ function startFFmpeg(channel) {
     "-f", "image2pipe",
     "pipe:1",
 
-    // OUTPUT 2: PCM AUDIO
+    // OUTPUT 2: PCM AUDIO — bỏ async=1000, chỉ resample
     "-map", "0:a:0?",
     "-vn",
-    "-af", `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.100:first_pts=0`,
+    "-af", `aresample=${AUDIO_SAMPLE_RATE}`,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
@@ -1303,7 +1372,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_MJPEG_PCM_LOW_LATENCY_SYNC",
+    pipeline: "REALTIME_MJPEG_PCM_AV_SYNC",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1335,6 +1404,8 @@ app.get("/health", (req, res) => {
     audioUnderflows,
     audioOverflowBytes,
     audioAdaptiveDrops,
+    audioSyncDrops,
+    audioSyncInserts,
     audioSilenceBytes,
     audioFramesSent,
     audioSilenceSent,
@@ -1344,6 +1415,12 @@ app.get("/health", (req, res) => {
         (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE) * 1000
       ).toFixed(1)
     ),
+
+    avSyncDiffMs: computeAvSyncDiffMs(),
+    avSyncAnchorTime,
+    avSyncRuntimeMs: avSyncAnchorTime > 0
+      ? Date.now() - avSyncAnchorTime
+      : 0,
 
     ppsErrorCount,
 
@@ -1364,7 +1441,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - LOW LATENCY SYNC MJPEG + PCM");
+  res.send("IPTV SERVER RUNNING - A/V SYNC MJPEG + PCM");
 });
 
 async function main() {
@@ -1383,9 +1460,8 @@ async function main() {
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
     console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
     console.log("AUDIO TARGET:", `${AUDIO_TARGET_MIN_MS}-${AUDIO_TARGET_MAX_MS}ms`);
-    console.log("AUDIO MAX DRIFT:", `${AUDIO_MAX_DRIFT_MS}ms`);
-    console.log("AUDIO OVERFLOW FACTOR:", AUDIO_OVERFLOW_FACTOR);
-    console.log("PIPELINE: LOW LATENCY SYNC MJPEG + PCM");
+    console.log("AV SYNC THRESHOLD:", `${AV_SYNC_THRESHOLD_MS}ms`);
+    console.log("PIPELINE: A/V SYNC MJPEG + PCM");
     console.log("BANDWIDTH API: /api/bandwidth");
     console.log("HEALTH API: /health");
     console.log("--------------------------------");
