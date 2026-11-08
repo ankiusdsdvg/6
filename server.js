@@ -20,6 +20,7 @@ const VIDEO_HEIGHT = 180;
 const VIDEO_FPS = 8;
 const JPEG_QUALITY = 8;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
+const BROADCAST_MIN_INTERVAL = Math.floor(VIDEO_INTERVAL * 0.85); // ~106ms
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
@@ -30,7 +31,7 @@ const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 1200;
+const AUDIO_START_BUFFER_MS = 500;
 const AUDIO_BUFFER_MS = 3000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
@@ -39,8 +40,8 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 1000;
-const AUDIO_TARGET_MAX_MS = 1800;
+const AUDIO_TARGET_MIN_MS = 500;
+const AUDIO_TARGET_MAX_MS = 1200;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
 const DECODER_THREADS = 2;
@@ -75,6 +76,8 @@ let ffmpeg = null;
 let generation = 0;
 
 let latestFrame = null;
+let latestFrameBroadcasted = false;
+let lastBroadcastTime = 0;
 let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
@@ -94,6 +97,7 @@ let audioBlockedSince = 0;
 let audioUnderflows = 0;
 let audioOverflowBytes = 0;
 let audioFramesSent = 0;
+let audioSilenceSent = 0;
 let audioPrimed = false;
 let audioSilenceBytes = 0;
 let audioLastTick = 0;
@@ -209,6 +213,7 @@ function resetAudioState(resetStats = false) {
     audioUnderflows = 0;
     audioOverflowBytes = 0;
     audioFramesSent = 0;
+    audioSilenceSent = 0;
     audioSilenceBytes = 0;
   }
 }
@@ -240,7 +245,14 @@ function disconnectAudioClient() {
 }
 
 function pushAudioBuffer(chunk) {
-  if (!audioClient || audioClient.destroyed || !chunk?.length) return;
+  if (
+    !audioClient ||
+    audioClient.destroyed ||
+    audioClient.writableEnded ||
+    !chunk?.length
+  ) {
+    return;
+  }
 
   if (chunk.length & 1) {
     chunk = chunk.subarray(0, chunk.length - 1);
@@ -326,9 +338,45 @@ function takeAudioFrame() {
   return frame;
 }
 
-// Tick audio 1 lần: gửi đủ số frame theo elapsed (deadline tuyệt đối)
+function writeAudioFrame(frame, isSilence = false) {
+  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
+    disconnectAudioClient();
+    return false;
+  }
+
+  try {
+    const ok = audioClient.write(frame);
+
+    if (isSilence) {
+      audioSilenceSent++;
+    } else {
+      audioFramesSent++;
+    }
+
+    if (!ok) {
+      audioBlocked = true;
+      audioBlockedSince = Date.now();
+
+      audioClient.once("drain", () => {
+        audioBlocked = false;
+        audioBlockedSince = 0;
+      });
+
+      return false;
+    }
+
+    return true;
+
+  } catch (error) {
+    console.error("[AUDIO WRITE]", error.message);
+    disconnectAudioClient();
+    return false;
+  }
+}
+
+// Tick audio: gửi đủ số frame theo elapsed (deadline tuyệt đối)
 function audioTick() {
-  if (!audioClient || audioClient.destroyed) {
+  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
     disconnectAudioClient();
     return;
   }
@@ -349,7 +397,6 @@ function audioTick() {
     console.warn("[AUDIO] Sender clock delayed:", elapsed, "ms");
   }
 
-  // Số frame cần gửi để bám kịp wallclock
   const framesToSend = Math.max(1, Math.round(elapsed / AUDIO_INTERVAL));
 
   for (let i = 0; i < framesToSend; i++) {
@@ -359,7 +406,11 @@ function audioTick() {
         audioTargetBufferMs / 1000
       );
 
-      if (audioBuffer.length < targetBytes) return;
+      if (audioBuffer.length < targetBytes) {
+        // Gửi silence để giữ kết nối sống trong lúc chờ prebuffer
+        if (!writeAudioFrame(makeSilenceFrame(), true)) return;
+        continue;
+      }
 
       audioPrimed = true;
       console.log("[AUDIO] Prebuffer ready:", audioBuffer.length, "bytes");
@@ -367,32 +418,12 @@ function audioTick() {
 
     const frame = takeAudioFrame();
 
-    try {
-      const ok = audioClient.write(frame);
-      audioFramesSent++;
-
-      if (!ok) {
-        audioBlocked = true;
-        audioBlockedSince = Date.now();
-
-        audioClient.once("drain", () => {
-          audioBlocked = false;
-          audioBlockedSince = 0;
-        });
-
-        return;
-      }
-
-    } catch (error) {
-      console.error("[AUDIO WRITE]", error.message);
-      disconnectAudioClient();
-      return;
-    }
+    if (!writeAudioFrame(frame, false)) return;
   }
 }
 
 function scheduleAudioTick() {
-  if (!audioClient || audioClient.destroyed) {
+  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
     audioTimer = null;
     return;
   }
@@ -425,10 +456,11 @@ function startAudioTimer() {
 function clearVideoBuffer() {
   jpegPending = Buffer.alloc(0);
   latestFrame = null;
+  latestFrameBroadcasted = false;
+  lastBroadcastTime = 0;
   frameSequence = 0;
 }
 
-// Gửi frame mới tới tất cả client ngay khi có (event-driven, không polling)
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
 
@@ -556,7 +588,8 @@ function processVideoData(chunk, currentGeneration) {
       continue;
     }
 
-    if (latestFrame) {
+    // Chỉ đếm frame bị bỏ khi frame cũ chưa kịp broadcast
+    if (latestFrame && !latestFrameBroadcasted) {
       videoDroppedFrames++;
     }
 
@@ -567,8 +600,15 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
-    // Event-driven: gửi ngay, không chờ setInterval
-    broadcastFrame(latestFrame);
+    // Throttle wallclock: chỉ broadcast tối đa ~8fps
+    const now = Date.now();
+    if (now - lastBroadcastTime >= BROADCAST_MIN_INTERVAL) {
+      lastBroadcastTime = now;
+      broadcastFrame(latestFrame);
+      latestFrameBroadcasted = true;
+    } else {
+      latestFrameBroadcasted = false;
+    }
 
     jpegPending = jpegPending.subarray(frameLength);
   }
@@ -599,7 +639,6 @@ function stopFFmpeg() {
 
   disconnectAudioClient();
 
-  // Đóng tất cả video client
   for (const res of videoClientsMap.keys()) {
     try { res.destroy(); } catch (_) {}
   }
@@ -669,7 +708,7 @@ function startFFmpeg(channel) {
     "-filter_threads", "1",
     "-i", channel.url,
 
-    // OUTPUT 1: MJPEG VIDEO — ép CFR đúng 8fps
+    // OUTPUT 1: MJPEG VIDEO
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
@@ -678,7 +717,6 @@ function startFFmpeg(channel) {
     "-threads", String(ENCODER_THREADS),
     "-fps_mode", "cfr",
     "-r", String(VIDEO_FPS),
-    "-vsync", "cfr",
     "-flush_packets", "1",
     "-f", "image2pipe",
     "pipe:1",
@@ -813,8 +851,12 @@ app.get("/stream", (req, res) => {
 
   videoClientsMap.set(res, state);
 
-  // Gửi frame hiện tại ngay nếu có
-  if (latestFrame && Date.now() - lastVideoFrameTime <= 1500) {
+  // Gửi frame hiện tại ngay nếu có và còn tươi
+  if (
+    latestFrame &&
+    Date.now() - lastVideoFrameTime <= 1500 &&
+    frameSequence > 0
+  ) {
     try {
       const header = Buffer.from(
         `--frame\r\n` +
@@ -854,13 +896,19 @@ app.get("/audio", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  console.log("[AUDIO] Client connected; waiting for PCM prebuffer");
+  console.log("[AUDIO] Client connected; sending silence until prebuffer ready");
 
   startAudioTimer();
 
   res.on("close", () => {
     if (audioClient === res) {
       console.log("[AUDIO] Client disconnected");
+      disconnectAudioClient();
+    }
+  });
+
+  res.on("error", () => {
+    if (audioClient === res) {
       disconnectAudioClient();
     }
   });
@@ -1191,11 +1239,12 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "EVENT_DRIVEN_MJPEG_PCM_ADAPTIVE_BUFFER",
+    pipeline: "EVENT_DRIVEN_MJPEG_PCM_THROTTLED",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
+    videoBroadcastInterval: BROADCAST_MIN_INTERVAL,
     videoDroppedFrames,
     videoInvalidFrames,
     videoSentFrames,
@@ -1205,6 +1254,9 @@ app.get("/health", (req, res) => {
     videoFrameSequence: frameSequence,
     videoFrameAge: lastVideoFrameTime
       ? Date.now() - lastVideoFrameTime
+      : null,
+    videoLastBroadcastAgo: lastBroadcastTime
+      ? Date.now() - lastBroadcastTime
       : null,
 
     audioSampleRate: AUDIO_SAMPLE_RATE,
@@ -1223,6 +1275,7 @@ app.get("/health", (req, res) => {
     audioOverflowBytes,
     audioSilenceBytes,
     audioFramesSent,
+    audioSilenceSent,
 
     memory: {
       rssMB: Number((memory.rss / 1048576).toFixed(2)),
@@ -1241,7 +1294,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - EVENT-DRIVEN MJPEG + PCM");
+  res.send("IPTV SERVER RUNNING - THROTTLED MJPEG + PCM");
 });
 
 async function main() {
@@ -1257,9 +1310,10 @@ async function main() {
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
     console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
+    console.log("BROADCAST MIN INTERVAL:", BROADCAST_MIN_INTERVAL, "ms");
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
     console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
-    console.log("PIPELINE: EVENT-DRIVEN MJPEG + PCM ADAPTIVE BUFFER");
+    console.log("PIPELINE: THROTTLED MJPEG + PCM ADAPTIVE BUFFER");
     console.log("BANDWIDTH API: /api/bandwidth");
     console.log("HEALTH API: /health");
     console.log("--------------------------------");
