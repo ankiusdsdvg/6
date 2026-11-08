@@ -17,8 +17,8 @@ const M3U_URLS = [
 
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 180;
-const VIDEO_FPS = 8;
-const JPEG_QUALITY = 8;
+const VIDEO_FPS = 12;
+const JPEG_QUALITY = 12;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
