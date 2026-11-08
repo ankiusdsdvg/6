@@ -30,8 +30,9 @@ const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 1000;
-const AUDIO_BUFFER_MS = 3000;
+// Giảm prebuffer/target để audio gần hình hơn
+const AUDIO_START_BUFFER_MS = 500;
+const AUDIO_BUFFER_MS = 2000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_BUFFER_MS / 1000;
@@ -39,12 +40,15 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 800;
-const AUDIO_TARGET_MAX_MS = 1600;
-const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
+const AUDIO_TARGET_MIN_MS = 400;
+const AUDIO_TARGET_MAX_MS = 800;
+const AUDIO_STABLE_FRAMES_TO_REDUCE = 100;
 
-// Ngưỡng drop khi buffer tích tụ quá lớn (gấp đôi target)
-const AUDIO_OVERFLOW_FACTOR = 2;
+// Drift tối đa: nếu buffer vượt target + drift → drop để bắt kịp
+const AUDIO_MAX_DRIFT_MS = 400;
+
+// Ngưỡng drop khẩn cấp (factor × target)
+const AUDIO_OVERFLOW_FACTOR = 1.5;
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
@@ -52,6 +56,10 @@ const ENCODER_THREADS = 1;
 const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
+
+// Ngưỡng đếm lỗi PPS
+const PPS_ERROR_WINDOW_MS = 10000;
+const PPS_ERROR_THRESHOLD = 20;
 
 const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
@@ -108,6 +116,9 @@ let restartTimer = null;
 let lastVideoFrameTime = 0;
 let restarting = false;
 let manuallyStopped = true;
+
+let ppsErrorCount = 0;
+let ppsErrorWindowStart = 0;
 
 // =====================================================
 // PLAYLIST
@@ -375,7 +386,6 @@ function writeAudioFrame(frame, isSilence = false) {
   }
 }
 
-// 🔥 Audio tick với adaptive drop — bắt kịp khi buffer tích tụ
 function audioTick() {
   if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
     disconnectAudioClient();
@@ -405,8 +415,13 @@ function audioTick() {
     audioTargetBufferMs / 1000
   );
 
-  // Adaptive drop: nếu buffer tích tụ > factor × target → bỏ frame cũ để bắt kịp
-  if (audioPrimed && audioBuffer.length > targetBytes * AUDIO_OVERFLOW_FACTOR) {
+  const driftBytes = Math.floor(
+    AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE *
+    AUDIO_MAX_DRIFT_MS / 1000
+  );
+
+  // Drop khi buffer vượt target + drift (giữ audio gần hình)
+  if (audioPrimed && audioBuffer.length > targetBytes + driftBytes) {
     const dropBytes = (audioBuffer.length - targetBytes) & ~1;
 
     audioBuffer = audioBuffer.subarray(dropBytes);
@@ -414,8 +429,24 @@ function audioTick() {
     audioAdaptiveDrops++;
 
     console.warn(
-      "[AUDIO] Buffer overflow: dropped", dropBytes, "bytes (buffer:",
+      "[AUDIO] Drift drop: dropped", dropBytes, "bytes (buffer:",
       audioBuffer.length, "target:", targetBytes, ")"
+    );
+  }
+
+  // Drop khẩn cấp nếu buffer > factor × target
+  if (
+    audioPrimed &&
+    audioBuffer.length > targetBytes * AUDIO_OVERFLOW_FACTOR + driftBytes
+  ) {
+    const dropBytes = (audioBuffer.length - targetBytes) & ~1;
+
+    audioBuffer = audioBuffer.subarray(dropBytes);
+    audioOverflowBytes += dropBytes;
+    audioAdaptiveDrops++;
+
+    console.warn(
+      "[AUDIO] Overflow drop: dropped", dropBytes, "bytes"
     );
   }
 
@@ -674,6 +705,9 @@ function startFFmpeg(channel) {
   videoInvalidFrames = 0;
   videoSentFrames = 0;
 
+  ppsErrorCount = 0;
+  ppsErrorWindowStart = Date.now();
+
   const currentGeneration = generation;
 
   lastVideoFrameTime = Date.now();
@@ -684,7 +718,9 @@ function startFFmpeg(channel) {
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
-  console.log("MODE: -re input realtime, -r output CFR");
+  console.log("AUDIO TARGET:", `${AUDIO_TARGET_MIN_MS}-${AUDIO_TARGET_MAX_MS}ms`);
+  console.log("AUDIO MAX DRIFT:", `${AUDIO_MAX_DRIFT_MS}ms`);
+  console.log("MODE: -re input, -r output, adaptive sync");
   console.log("==================================");
 
   const videoFilter = [
@@ -702,7 +738,8 @@ function startFFmpeg(channel) {
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    "-fflags", "+discardcorrupt+genpts",
+    "-fflags", "+discardcorrupt+genpts+igndts",
+    "-err_detect", "ignore_err",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
     "-re",
@@ -753,8 +790,39 @@ function startFFmpeg(channel) {
 
   child.stderr.on("data", data => {
     const message = data.toString().trim();
-    if (message) {
-      console.log("[FFmpeg]", message);
+    if (!message) return;
+
+    console.log("[FFmpeg]", message);
+
+    const isPpsError =
+      message.includes("non-existing PPS") ||
+      message.includes("decode_slice_header error") ||
+      message.includes("no frame!");
+
+    if (isPpsError) {
+      const now = Date.now();
+
+      if (now - ppsErrorWindowStart > PPS_ERROR_WINDOW_MS) {
+        ppsErrorCount = 0;
+        ppsErrorWindowStart = now;
+      }
+
+      ppsErrorCount++;
+
+      if (ppsErrorCount >= PPS_ERROR_THRESHOLD && !restarting) {
+        console.warn(
+          "[WATCHDOG] Too many PPS errors (",
+          ppsErrorCount,
+          "in",
+          PPS_ERROR_WINDOW_MS / 1000,
+          "s) — restarting FFmpeg"
+        );
+
+        ppsErrorCount = 0;
+        ppsErrorWindowStart = now;
+
+        scheduleRestart();
+      }
     }
   });
 
@@ -1235,7 +1303,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_MJPEG_PCM_ADAPTIVE_SYNC",
+    pipeline: "REALTIME_MJPEG_PCM_LOW_LATENCY_SYNC",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1259,6 +1327,7 @@ app.get("/health", (req, res) => {
     audioBufferMax: AUDIO_BUFFER_MAX,
     audioStartBufferMs: AUDIO_START_BUFFER_MS,
     audioTargetBufferMs,
+    audioMaxDriftMs: AUDIO_MAX_DRIFT_MS,
     audioPrimed,
     audioMaxObservedBytes,
     audioClientConnected: !!audioClient && !audioClient.destroyed,
@@ -1275,6 +1344,8 @@ app.get("/health", (req, res) => {
         (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE) * 1000
       ).toFixed(1)
     ),
+
+    ppsErrorCount,
 
     memory: {
       rssMB: Number((memory.rss / 1048576).toFixed(2)),
@@ -1293,7 +1364,7 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - ADAPTIVE SYNC MJPEG + PCM");
+  res.send("IPTV SERVER RUNNING - LOW LATENCY SYNC MJPEG + PCM");
 });
 
 async function main() {
@@ -1312,8 +1383,9 @@ async function main() {
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
     console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
     console.log("AUDIO TARGET:", `${AUDIO_TARGET_MIN_MS}-${AUDIO_TARGET_MAX_MS}ms`);
+    console.log("AUDIO MAX DRIFT:", `${AUDIO_MAX_DRIFT_MS}ms`);
     console.log("AUDIO OVERFLOW FACTOR:", AUDIO_OVERFLOW_FACTOR);
-    console.log("PIPELINE: ADAPTIVE SYNC MJPEG + PCM");
+    console.log("PIPELINE: LOW LATENCY SYNC MJPEG + PCM");
     console.log("BANDWIDTH API: /api/bandwidth");
     console.log("HEALTH API: /health");
     console.log("--------------------------------");
