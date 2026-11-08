@@ -17,7 +17,10 @@ const M3U_URLS = [
 
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 180;
-const VIDEO_FPS = 8;
+const VIDEO_FPS = 12;              // FPS tối đa FFmpeg encode
+const DEFAULT_CLIENT_FPS = 8;      // FPS mặc định nếu client không xin
+const MIN_CLIENT_FPS = 1;
+const MAX_CLIENT_FPS = 30;
 const JPEG_QUALITY = 8;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
@@ -52,7 +55,11 @@ const RESTART_DELAY = 3000;
 
 const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
-const MAX_CLIENT_BLOCK_MS = 1500;
+
+// 🔥 TỰ PHỤC HỒI CLIENT
+const CLIENT_SKIP_THRESHOLD_MS = 300;   // block > 300ms → bỏ frame
+const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
+
 const MAX_AUDIO_BLOCK_MS = 1500;
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
@@ -83,7 +90,7 @@ let videoInvalidFrames = 0;
 let videoSentFrames = 0;
 let videoClients = 0;
 
-// Map: res -> { blocked, blockedSince, lastSentSequence }
+// Map: res -> state
 const videoClientsMap = new Map();
 
 let audioBuffer = Buffer.alloc(0);
@@ -454,6 +461,7 @@ function clearVideoBuffer() {
   frameSequence = 0;
 }
 
+// 🔥 BROADCAST VỚI TỰ PHỤC HỒI
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
 
@@ -474,16 +482,42 @@ function broadcastFrame(frame) {
       continue;
     }
 
+    // 🔥 Client đang block
     if (state.blocked) {
-      if (now - state.blockedSince > MAX_CLIENT_BLOCK_MS) {
-        console.log("[VIDEO] Slow client disconnected");
+      const blockDuration = now - state.blockedSince;
+
+      // Block quá lâu → ngắt
+      if (blockDuration > MAX_CLIENT_BLOCK_MS) {
+        console.log(
+          "[VIDEO] Slow client disconnected after",
+          blockDuration, "ms block (skipped:",
+          state.skippedFrames, ")"
+        );
         cleanupVideoClient(res);
         try { res.destroy(); } catch (_) {}
+        continue;
       }
-      continue;
+
+      // Block > 300ms → BỎ FRAME này (tự phục hồi)
+      if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
+        state.skippedFrames++;
+        continue;
+      }
+
+      // Block < 300ms → thử ghi tiếp
     }
 
     if (state.lastSentSequence === frameSequence) continue;
+
+    // Per-client throttle
+    if (state.clientInterval > 0) {
+      const timeSinceLastSend = now - state.lastSentTime;
+
+      if (timeSinceLastSend < state.clientInterval * 0.9) {
+        state.skippedFrames++;
+        continue;
+      }
+    }
 
     try {
       let ok = res.write(header);
@@ -491,11 +525,15 @@ function broadcastFrame(frame) {
       if (!res.write(trailer)) ok = false;
 
       state.lastSentSequence = frameSequence;
+      state.lastSentTime = now;
       videoSentFrames++;
 
       if (!ok) {
-        state.blocked = true;
-        state.blockedSince = Date.now();
+        if (!state.blocked) {
+          state.blocked = true;
+          state.blockedSince = Date.now();
+          state.blockCount++;
+        }
 
         res.once("drain", () => {
           state.blocked = false;
@@ -588,7 +626,6 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
-    // Không throttle, broadcast ngay mỗi frame
     broadcastFrame(latestFrame);
 
     jpegPending = jpegPending.subarray(frameLength);
@@ -663,13 +700,14 @@ function startFFmpeg(channel) {
   console.log("\n==================================");
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
-  console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
+  console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS} (max)`);
+  console.log("DEFAULT CLIENT FPS:", DEFAULT_CLIENT_FPS);
+  console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
+  console.log("MAX BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-  console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
-  console.log("MODE: -re input realtime, -r output CFR");
+  console.log("MODE: -re input, -r output, per-client throttle, auto-recover");
   console.log("==================================");
 
-  // BỎ filter fps=8 — để output -r lo
   const videoFilter = [
     `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
     `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
@@ -688,10 +726,10 @@ function startFFmpeg(channel) {
     "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
-    "-re",                          // Đọc input realtime
+    "-re",
     "-i", channel.url,
 
-    // OUTPUT 1: MJPEG VIDEO — ép 8fps output
+    // OUTPUT 1: MJPEG VIDEO
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
@@ -811,17 +849,38 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM
+// VIDEO STREAM - HỖ TRỢ ?fps=xxx
 // =====================================================
 
 app.get("/stream", (req, res) => {
+  const requestedFps = Number(req.query.fps);
+  let clientFps = DEFAULT_CLIENT_FPS;
+
+  if (Number.isFinite(requestedFps) && requestedFps > 0) {
+    clientFps = Math.max(
+      MIN_CLIENT_FPS,
+      Math.min(MAX_CLIENT_FPS, Math.floor(requestedFps))
+    );
+  }
+
+  const clientInterval = clientFps >= VIDEO_FPS
+    ? 0
+    : (1000 / clientFps);
+
+  console.log(
+    "[VIDEO] Client connected - requested fps:",
+    req.query.fps || "default",
+    "→ effective fps:", clientFps
+  );
+
   res.writeHead(200, {
     "Content-Type": "multipart/x-mixed-replace; boundary=frame",
     "Cache-Control": "no-cache, no-store, must-revalidate",
     "Pragma": "no-cache",
     "Expires": "0",
     "Connection": "keep-alive",
-    "X-Accel-Buffering": "no"
+    "X-Accel-Buffering": "no",
+    "X-Client-FPS": String(clientFps)
   });
 
   videoClients++;
@@ -829,7 +888,12 @@ app.get("/stream", (req, res) => {
   const state = {
     blocked: false,
     blockedSince: 0,
-    lastSentSequence: -1
+    lastSentSequence: -1,
+    clientFps,
+    clientInterval,
+    lastSentTime: 0,
+    skippedFrames: 0,
+    blockCount: 0
   };
 
   videoClientsMap.set(res, state);
@@ -852,6 +916,7 @@ app.get("/stream", (req, res) => {
       res.write("\r\n");
 
       state.lastSentSequence = frameSequence;
+      state.lastSentTime = Date.now();
       videoSentFrames++;
     } catch (_) {}
   }
@@ -1210,6 +1275,21 @@ app.get("/api/bandwidth", async (req, res) => {
 app.get("/health", (req, res) => {
   const memory = process.memoryUsage();
 
+  const clientDetails = [];
+  const now = Date.now();
+
+  for (const [, state] of videoClientsMap) {
+    clientDetails.push({
+      fps: state.clientFps,
+      interval: state.clientInterval,
+      skipped: state.skippedFrames,
+      blockCount: state.blockCount,
+      blocked: state.blocked,
+      blockDurationMs: state.blocked ? now - state.blockedSince : 0,
+      lastSentAgoMs: state.lastSentTime ? now - state.lastSentTime : null
+    });
+  }
+
   res.json({
     status: "running",
     channelCount: channels.length,
@@ -1218,11 +1298,14 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_MJPEG_PCM_RE_INPUT",
+    pipeline: "REALTIME_MJPEG_PCM_AUTO_RECOVER",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
+    defaultClientFps: DEFAULT_CLIENT_FPS,
+    skipThresholdMs: CLIENT_SKIP_THRESHOLD_MS,
+    maxClientBlockMs: MAX_CLIENT_BLOCK_MS,
     videoDroppedFrames,
     videoInvalidFrames,
     videoSentFrames,
@@ -1233,6 +1316,7 @@ app.get("/health", (req, res) => {
     videoFrameAge: lastVideoFrameTime
       ? Date.now() - lastVideoFrameTime
       : null,
+    clientDetails,
 
     audioSampleRate: AUDIO_SAMPLE_RATE,
     audioChannels: AUDIO_CHANNELS,
@@ -1269,7 +1353,18 @@ app.get("/health", (req, res) => {
 // =====================================================
 
 app.get("/", (req, res) => {
-  res.send("IPTV SERVER RUNNING - REALTIME MJPEG + PCM (-re input)");
+  res.send(
+    "IPTV SERVER RUNNING - AUTO RECOVER MJPEG + PCM\n" +
+    "Usage:\n" +
+    "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
+    "  /stream?fps=12       → 12 fps (ESP32 sẽ tự phục hồi)\n" +
+    "  /stream?fps=6        → 6 fps\n" +
+    "  /audio               → PCM audio\n" +
+    "\nAuto-recover:\n" +
+    "  - Client block < " + CLIENT_SKIP_THRESHOLD_MS + "ms → gửi tiếp\n" +
+    "  - Client block > " + CLIENT_SKIP_THRESHOLD_MS + "ms → bỏ frame, tự phục hồi\n" +
+    "  - Client block > " + MAX_CLIENT_BLOCK_MS + "ms → ngắt kết nối"
+  );
 });
 
 async function main() {
@@ -1284,12 +1379,13 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
+    console.log("VIDEO (max):", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
+    console.log("DEFAULT CLIENT FPS:", DEFAULT_CLIENT_FPS);
+    console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
+    console.log("MAX CLIENT BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-    console.log("AUDIO PREBUFFER:", `${AUDIO_START_BUFFER_MS}ms`);
-    console.log("PIPELINE: REALTIME MJPEG + PCM (-re input)");
-    console.log("BANDWIDTH API: /api/bandwidth");
-    console.log("HEALTH API: /health");
+    console.log("PIPELINE: AUTO RECOVER MJPEG + PCM");
+    console.log("STREAM API: /stream?fps=N  (N = 1..30)");
     console.log("--------------------------------");
   });
 }
