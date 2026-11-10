@@ -21,9 +21,7 @@ const VIDEO_FPS = 12;              // hình theo đúng yêu cầu API
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-// Q thấp hơn một chút để JPEG cảnh nhiều chi tiết không làm encoder/socket
-// nghẽn; nhịp 12 fps ổn định quan trọng hơn vài KB chất lượng ảnh.
-const JPEG_QUALITY = 12;
+const JPEG_QUALITY = 8;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -57,11 +55,6 @@ const RESTART_DELAY = 3000;
 
 const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
-// Không cho socket client giữ hàng đợi frame cũ. Mỗi client chỉ có tối đa một
-// frame đang chờ; frame chờ luôn bị ghi đè bằng frame mới nhất.
-const MAX_CLIENT_QUEUED_BYTES = 16 * 1024;
-const MAX_CLIENT_BACKLOG_BYTES = 64 * 1024;
-
 // 🔥 TỰ PHỤC HỒI CLIENT
 const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
 const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
@@ -467,87 +460,8 @@ function clearVideoBuffer() {
   frameSequence = 0;
 }
 
-function queueLatestVideoFrame(state, frame, sequence) {
-  state.pendingFrame = frame;
-  state.pendingSequence = sequence;
-  state.skippedFrames++;
-}
-
-function writeVideoFrame(res, state, frame, sequence, now) {
-  if (
-    !frame ||
-    res.destroyed ||
-    res.writableEnded ||
-    state.lastSentSequence === sequence
-  ) {
-    return;
-  }
-
-  const queuedBytes = Number(res.writableLength || 0);
-  if (queuedBytes > MAX_CLIENT_BACKLOG_BYTES) {
-    console.log("[VIDEO] Dropping client with stale TCP backlog:", queuedBytes);
-    cleanupVideoClient(res);
-    try { res.destroy(); } catch (_) {}
-    return;
-  }
-
-  if (queuedBytes > MAX_CLIENT_QUEUED_BYTES || state.blocked) {
-    queueLatestVideoFrame(state, frame, sequence);
-    return;
-  }
-
-  if (state.clientInterval > 0 && state.lastSentTime > 0) {
-    const timeSinceLastSend = now - state.lastSentTime;
-    if (timeSinceLastSend < state.clientInterval * 0.9) {
-      queueLatestVideoFrame(state, frame, sequence);
-      return;
-    }
-  }
-
-  const header = Buffer.from(
-    `--frame\r\n` +
-    `Content-Type: image/jpeg\r\n` +
-    `Content-Length: ${frame.length}\r\n` +
-    `\r\n`
-  );
-
-  try {
-    let ok = res.write(header);
-    if (!res.write(frame)) ok = false;
-    if (!res.write("\r\n")) ok = false;
-
-    state.lastSentSequence = sequence;
-    state.lastSentTime = now;
-    videoSentFrames++;
-
-    if (!ok && !state.drainAttached) {
-      state.blocked = true;
-      state.blockedSince = now;
-      state.blockCount++;
-      state.drainAttached = true;
-      res.once("drain", () => {
-        state.drainAttached = false;
-        state.blocked = false;
-        state.blockedSince = 0;
-
-        const pendingFrame = state.pendingFrame;
-        const pendingSequence = state.pendingSequence;
-        state.pendingFrame = null;
-        state.pendingSequence = -1;
-        if (pendingFrame) {
-          writeVideoFrame(res, state, pendingFrame, pendingSequence, Date.now());
-        }
-      });
-    }
-  } catch (error) {
-    console.error("[VIDEO WRITE]", error.message);
-    cleanupVideoClient(res);
-    try { res.destroy(); } catch (_) {}
-  }
-}
-
-// Broadcast latest-frame only: never append a second old JPEG to a slow TCP
-// client. A pending frame is replaced by the newest one until drain fires.
+// Broadcast at the source cadence. Node's normal backpressure handling skips
+// blocked frames without tearing down a healthy audio/video session.
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
   const now = Date.now();
@@ -557,7 +471,56 @@ function broadcastFrame(frame) {
       cleanupVideoClient(res);
       continue;
     }
-    writeVideoFrame(res, state, frame, frameSequence, now);
+
+    if (state.blocked) {
+      const blockDuration = now - state.blockedSince;
+      if (blockDuration > MAX_CLIENT_BLOCK_MS) {
+        cleanupVideoClient(res);
+        try { res.destroy(); } catch (_) {}
+      } else {
+        state.skippedFrames++;
+      }
+      continue;
+    }
+
+    if (state.lastSentSequence === frameSequence) continue;
+
+    if (state.clientInterval > 0 && state.lastSentTime > 0 &&
+        now - state.lastSentTime < state.clientInterval * 0.9) {
+      state.skippedFrames++;
+      continue;
+    }
+
+    const header = Buffer.from(
+      `--frame\r\n` +
+      `Content-Type: image/jpeg\r\n` +
+      `Content-Length: ${frame.length}\r\n` +
+      `\r\n`
+    );
+
+    try {
+      let ok = res.write(header);
+      if (!res.write(frame)) ok = false;
+      if (!res.write("\r\n")) ok = false;
+
+      state.lastSentSequence = frameSequence;
+      state.lastSentTime = now;
+      videoSentFrames++;
+
+      if (!ok) {
+        state.blocked = true;
+        state.blockedSince = now;
+        state.blockCount++;
+        res.once("drain", () => {
+          state.blocked = false;
+          state.blockedSince = 0;
+        });
+      }
+    } catch (error) {
+      console.error("[VIDEO WRITE]", error.message);
+      cleanupVideoClient(res);
+      try { res.destroy(); } catch (_) {}
+    }
   }
 }
 
@@ -734,16 +697,10 @@ function startFFmpeg(channel) {
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    // Giảm bộ đệm đầu vào của FFmpeg để relay không tích tụ trễ khi nguồn có
-    // cảnh nặng. Audio output và clock PCM giữ nguyên như trước.
-    "-fflags", "+nobuffer+discardcorrupt+genpts",
-    "-flags", "low_delay",
-    "-avioflags", "direct",
-    "-max_delay", "0",
+    "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
-    // Nguồn là live stream, không dùng -re (chỉ phù hợp khi đọc file). -re
-    // làm FFmpeg đọc theo nhịp giả, tạo burst/hụt và khiến client trễ dần.
+    "-re",
     "-i", channel.url,
 
     // OUTPUT 1: MJPEG VIDEO
@@ -905,9 +862,6 @@ app.get("/stream", (req, res) => {
   const state = {
     blocked: false,
     blockedSince: 0,
-    drainAttached: false,
-    pendingFrame: null,
-    pendingSequence: -1,
     lastSentSequence: -1,
     clientFps,
     clientInterval,
