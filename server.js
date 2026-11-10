@@ -67,7 +67,7 @@ const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu ";
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
+  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
 const BANDWIDTH_LIMIT_GB = Number(process.env.BANDWIDTH_LIMIT_GB || 5);
