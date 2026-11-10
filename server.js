@@ -15,13 +15,13 @@ const M3U_URLS = [
   "https://iptv-org.github.io/iptv/countries/vn.m3u"
 ];
 
-const VIDEO_WIDTH = 240;
-const VIDEO_HEIGHT = 180;
-const VIDEO_FPS = 12;              // hình theo đúng yêu cầu API
+const VIDEO_WIDTH = 320;
+const VIDEO_HEIGHT = 240;
+const VIDEO_FPS = 12;              // FPS tối đa FFmpeg encode
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-const JPEG_QUALITY = 12;
+const JPEG_QUALITY = 18;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -55,6 +55,7 @@ const RESTART_DELAY = 3000;
 
 const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
+
 // 🔥 TỰ PHỤC HỒI CLIENT
 const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
 const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
@@ -66,7 +67,7 @@ const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_E4m8zGWRFKuhlc7kAuvU8IPoTZd5";
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
+  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
 const BANDWIDTH_LIMIT_GB = Number(process.env.BANDWIDTH_LIMIT_GB || 5);
@@ -108,7 +109,6 @@ let audioMaxObservedBytes = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
-let idleStopTimer = null;
 let lastVideoFrameTime = 0;
 let restarting = false;
 let manuallyStopped = true;
@@ -464,6 +464,7 @@ function clearVideoBuffer() {
 // 🔥 BROADCAST VỚI TỰ PHỤC HỒI
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
+
   const now = Date.now();
 
   const header = Buffer.from(
@@ -497,7 +498,7 @@ function broadcastFrame(frame) {
         continue;
       }
 
-      // Block ngắn: bỏ frame hiện tại, không xếp frame cũ vào socket.
+      // Block > 300ms → BỎ FRAME này (tự phục hồi)
       if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
         state.skippedFrames++;
         continue;
@@ -508,42 +509,38 @@ function broadcastFrame(frame) {
 
     if (state.lastSentSequence === frameSequence) continue;
 
-    if (state.clientInterval > 0 && state.lastSentTime > 0 &&
-        now - state.lastSentTime < state.clientInterval * 0.9) {
-      state.skippedFrames++;
-      continue;
-    }
+    // Per-client throttle
+    if (state.clientInterval > 0) {
+      const timeSinceLastSend = now - state.lastSentTime;
 
-    try {
-      // Nếu socket đã đầy thì bỏ cả part trước khi ghi, tránh xếp JPEG cũ
-      // trong Node. Một part đã bắt đầu ghi phải luôn đủ header/JPEG/trailer.
-      if (res.writableNeedDrain) {
-        state.blocked = true;
-        state.blockedSince = now;
-        state.blockCount++;
-        res.once("drain", () => {
-          state.blocked = false;
-          state.blockedSince = 0;
-        });
+      if (timeSinceLastSend < state.clientInterval * 0.9) {
         state.skippedFrames++;
         continue;
       }
-      const headerOk = res.write(header);
-      const frameOk = res.write(frame);
-      const trailerOk = res.write(trailer);
-      if (!headerOk || !frameOk || !trailerOk) {
-        state.blocked = true;
-        state.blockedSince = now;
-        state.blockCount++;
-        res.once("drain", () => {
-          state.blocked = false;
-          state.blockedSince = 0;
-        });
-      }
+    }
+
+    try {
+      let ok = res.write(header);
+      if (!res.write(frame)) ok = false;
+      if (!res.write(trailer)) ok = false;
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
       videoSentFrames++;
+
+      if (!ok) {
+        if (!state.blocked) {
+          state.blocked = true;
+          state.blockedSince = Date.now();
+          state.blockCount++;
+        }
+
+        res.once("drain", () => {
+          state.blocked = false;
+          state.blockedSince = 0;
+        });
+      }
+
     } catch (error) {
       console.error("[VIDEO WRITE]", error.message);
       cleanupVideoClient(res);
@@ -557,7 +554,6 @@ function cleanupVideoClient(res) {
 
   videoClientsMap.delete(res);
   videoClients = Math.max(0, videoClients - 1);
-  scheduleIdleStop();
 }
 
 function processVideoData(chunk, currentGeneration) {
@@ -647,27 +643,7 @@ function clearWatchdog() {
   }
 }
 
-function clearIdleStop() {
-  if (idleStopTimer) {
-    clearTimeout(idleStopTimer);
-    idleStopTimer = null;
-  }
-}
-
-function scheduleIdleStop() {
-  clearIdleStop();
-  if (!currentChannel || manuallyStopped || videoClientsMap.size || audioClient) return;
-  idleStopTimer = setTimeout(() => {
-    idleStopTimer = null;
-    if (!videoClientsMap.size && !audioClient && currentChannel && !manuallyStopped) {
-      stopFFmpeg();
-      currentChannel = null;
-    }
-  }, 3000);
-}
-
 function stopFFmpeg() {
-  clearIdleStop();
   generation++;
   manuallyStopped = true;
   restarting = false;
@@ -706,7 +682,6 @@ function startFFmpeg(channel) {
   }
 
   stopFFmpeg();
-  clearIdleStop();
 
   manuallyStopped = false;
   currentChannel = channel;
@@ -734,7 +709,8 @@ function startFFmpeg(channel) {
   console.log("==================================");
 
   const videoFilter = [
-    `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:flags=fast_bilinear`,
+    `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
+    `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
     "setsar=1"
   ].join(",");
 
@@ -975,14 +951,12 @@ app.get("/audio", (req, res) => {
     if (audioClient === res) {
       console.log("[AUDIO] Client disconnected");
       disconnectAudioClient();
-      scheduleIdleStop();
     }
   });
 
   res.on("error", () => {
     if (audioClient === res) {
       disconnectAudioClient();
-      scheduleIdleStop();
     }
   });
 });
