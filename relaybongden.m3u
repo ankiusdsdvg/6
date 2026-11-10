@@ -189,7 +189,7 @@ https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv12/master.m3u8
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv13/master.m3u8
 #EXTINF:-1 tvg-id="SCTV14.vn@SD",SCTV14 (720p)
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv14/master.m3u8
-#EXTINF:-1 tvg-id="SCTV16.vn@SD" tvg-logo="https://mytv.com.vn/upload/channel/206.png",SCTV16 (720p)
+#EXTINF:-1 tvg-id="SCTV16.vn@SD" tvg-logo="https://mytv.com.vn/upload/channel/206.png" group-title="SCTV",SCTV16 (720p)
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv16/master.m3u8
 #EXTINF:-1 tvg-id="SCTV18.vn@SD",SCTV18 (720p)
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv18/master.m3u8
