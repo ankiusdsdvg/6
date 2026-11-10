@@ -15,13 +15,13 @@ const M3U_URLS = [
   "https://iptv-org.github.io/iptv/countries/vn.m3u"
 ];
 
-const VIDEO_WIDTH = 240;
+const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 240;
 const VIDEO_FPS = 12;              // FPS tối đa FFmpeg encode
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-const JPEG_QUALITY = 10;
+const JPEG_QUALITY = 8;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
