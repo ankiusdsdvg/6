@@ -17,11 +17,13 @@ const M3U_URLS = [
 
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 240;
-const VIDEO_FPS = 12;              // FPS tối đa FFmpeg encode
+const VIDEO_FPS = 12;              // hình theo đúng yêu cầu API
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-const JPEG_QUALITY = 10;
+// Q thấp hơn một chút để JPEG cảnh nhiều chi tiết không làm encoder/socket
+// nghẽn; nhịp 12 fps ổn định quan trọng hơn vài KB chất lượng ảnh.
+const JPEG_QUALITY = 12;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -55,6 +57,10 @@ const RESTART_DELAY = 3000;
 
 const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
+// Không cho socket client giữ hàng đợi frame cũ. Mỗi client chỉ có tối đa một
+// frame đang chờ; frame chờ luôn bị ghi đè bằng frame mới nhất.
+const MAX_CLIENT_QUEUED_BYTES = 16 * 1024;
+const MAX_CLIENT_BACKLOG_BYTES = 64 * 1024;
 
 // 🔥 TỰ PHỤC HỒI CLIENT
 const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
@@ -65,9 +71,9 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_E4m8zGWRFKuhlc7kAuvU8IPoTZd5";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu ";
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
+  process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
 const BANDWIDTH_LIMIT_GB = Number(process.env.BANDWIDTH_LIMIT_GB || 5);
@@ -461,11 +467,42 @@ function clearVideoBuffer() {
   frameSequence = 0;
 }
 
-// 🔥 BROADCAST VỚI TỰ PHỤC HỒI
-function broadcastFrame(frame) {
-  if (!frame || !videoClientsMap.size) return;
+function queueLatestVideoFrame(state, frame, sequence) {
+  state.pendingFrame = frame;
+  state.pendingSequence = sequence;
+  state.skippedFrames++;
+}
 
-  const now = Date.now();
+function writeVideoFrame(res, state, frame, sequence, now) {
+  if (
+    !frame ||
+    res.destroyed ||
+    res.writableEnded ||
+    state.lastSentSequence === sequence
+  ) {
+    return;
+  }
+
+  const queuedBytes = Number(res.writableLength || 0);
+  if (queuedBytes > MAX_CLIENT_BACKLOG_BYTES) {
+    console.log("[VIDEO] Dropping client with stale TCP backlog:", queuedBytes);
+    cleanupVideoClient(res);
+    try { res.destroy(); } catch (_) {}
+    return;
+  }
+
+  if (queuedBytes > MAX_CLIENT_QUEUED_BYTES || state.blocked) {
+    queueLatestVideoFrame(state, frame, sequence);
+    return;
+  }
+
+  if (state.clientInterval > 0 && state.lastSentTime > 0) {
+    const timeSinceLastSend = now - state.lastSentTime;
+    if (timeSinceLastSend < state.clientInterval * 0.9) {
+      queueLatestVideoFrame(state, frame, sequence);
+      return;
+    }
+  }
 
   const header = Buffer.from(
     `--frame\r\n` +
@@ -474,78 +511,53 @@ function broadcastFrame(frame) {
     `\r\n`
   );
 
-  const trailer = Buffer.from("\r\n");
+  try {
+    let ok = res.write(header);
+    if (!res.write(frame)) ok = false;
+    if (!res.write("\r\n")) ok = false;
+
+    state.lastSentSequence = sequence;
+    state.lastSentTime = now;
+    videoSentFrames++;
+
+    if (!ok && !state.drainAttached) {
+      state.blocked = true;
+      state.blockedSince = now;
+      state.blockCount++;
+      state.drainAttached = true;
+      res.once("drain", () => {
+        state.drainAttached = false;
+        state.blocked = false;
+        state.blockedSince = 0;
+
+        const pendingFrame = state.pendingFrame;
+        const pendingSequence = state.pendingSequence;
+        state.pendingFrame = null;
+        state.pendingSequence = -1;
+        if (pendingFrame) {
+          writeVideoFrame(res, state, pendingFrame, pendingSequence, Date.now());
+        }
+      });
+    }
+  } catch (error) {
+    console.error("[VIDEO WRITE]", error.message);
+    cleanupVideoClient(res);
+    try { res.destroy(); } catch (_) {}
+  }
+}
+
+// Broadcast latest-frame only: never append a second old JPEG to a slow TCP
+// client. A pending frame is replaced by the newest one until drain fires.
+function broadcastFrame(frame) {
+  if (!frame || !videoClientsMap.size) return;
+  const now = Date.now();
 
   for (const [res, state] of videoClientsMap) {
     if (res.destroyed || res.writableEnded) {
       cleanupVideoClient(res);
       continue;
     }
-
-    // 🔥 Client đang block
-    if (state.blocked) {
-      const blockDuration = now - state.blockedSince;
-
-      // Block quá lâu → ngắt
-      if (blockDuration > MAX_CLIENT_BLOCK_MS) {
-        console.log(
-          "[VIDEO] Slow client disconnected after",
-          blockDuration, "ms block (skipped:",
-          state.skippedFrames, ")"
-        );
-        cleanupVideoClient(res);
-        try { res.destroy(); } catch (_) {}
-        continue;
-      }
-
-      // Block > 300ms → BỎ FRAME này (tự phục hồi)
-      if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
-        state.skippedFrames++;
-        continue;
-      }
-
-      // Block < 300ms → thử ghi tiếp
-    }
-
-    if (state.lastSentSequence === frameSequence) continue;
-
-    // Per-client throttle
-    if (state.clientInterval > 0) {
-      const timeSinceLastSend = now - state.lastSentTime;
-
-      if (timeSinceLastSend < state.clientInterval * 0.9) {
-        state.skippedFrames++;
-        continue;
-      }
-    }
-
-    try {
-      let ok = res.write(header);
-      if (!res.write(frame)) ok = false;
-      if (!res.write(trailer)) ok = false;
-
-      state.lastSentSequence = frameSequence;
-      state.lastSentTime = now;
-      videoSentFrames++;
-
-      if (!ok) {
-        if (!state.blocked) {
-          state.blocked = true;
-          state.blockedSince = Date.now();
-          state.blockCount++;
-        }
-
-        res.once("drain", () => {
-          state.blocked = false;
-          state.blockedSince = 0;
-        });
-      }
-
-    } catch (error) {
-      console.error("[VIDEO WRITE]", error.message);
-      cleanupVideoClient(res);
-      try { res.destroy(); } catch (_) {}
-    }
+    writeVideoFrame(res, state, frame, frameSequence, now);
   }
 }
 
@@ -709,8 +721,7 @@ function startFFmpeg(channel) {
   console.log("==================================");
 
   const videoFilter = [
-    `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:force_original_aspect_ratio=decrease:flags=fast_bilinear`,
-    `pad=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2`,
+    `scale=${VIDEO_WIDTH}:${VIDEO_HEIGHT}:flags=fast_bilinear`,
     "setsar=1"
   ].join(",");
 
@@ -723,10 +734,16 @@ function startFFmpeg(channel) {
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    "-fflags", "+discardcorrupt+genpts",
+    // Giảm bộ đệm đầu vào của FFmpeg để relay không tích tụ trễ khi nguồn có
+    // cảnh nặng. Audio output và clock PCM giữ nguyên như trước.
+    "-fflags", "+nobuffer+discardcorrupt+genpts",
+    "-flags", "low_delay",
+    "-avioflags", "direct",
+    "-max_delay", "0",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
-    "-re",
+    // Nguồn là live stream, không dùng -re (chỉ phù hợp khi đọc file). -re
+    // làm FFmpeg đọc theo nhịp giả, tạo burst/hụt và khiến client trễ dần.
     "-i", channel.url,
 
     // OUTPUT 1: MJPEG VIDEO
@@ -888,6 +905,9 @@ app.get("/stream", (req, res) => {
   const state = {
     blocked: false,
     blockedSince: 0,
+    drainAttached: false,
+    pendingFrame: null,
+    pendingSequence: -1,
     lastSentSequence: -1,
     clientFps,
     clientInterval,
