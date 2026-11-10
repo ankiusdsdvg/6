@@ -15,13 +15,13 @@ const M3U_URLS = [
   "https://iptv-org.github.io/iptv/countries/vn.m3u"
 ];
 
-const VIDEO_WIDTH = 320;
-const VIDEO_HEIGHT = 240;
+const VIDEO_WIDTH = 240;
+const VIDEO_HEIGHT = 180;
 const VIDEO_FPS = 12;              // hình theo đúng yêu cầu API
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-const JPEG_QUALITY = 15;
+const JPEG_QUALITY = 12;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -64,7 +64,7 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_E4m8zGWRFKuhlc7kAuvU8IPoTZd5";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_UybRGTZIqEAqpRaUxkylcFUR2MLu ";
 const RENDER_SERVICE_IDS = (
   process.env.RENDER_SERVICE_IDS || "srv-dbktk7s9v7es73fb7fcg"
 ).split(",").map(x => x.trim()).filter(Boolean);
@@ -496,7 +496,7 @@ function broadcastFrame(frame) {
         continue;
       }
 
-      // Block > 300ms → BỎ FRAME này (tự phục hồi)
+      // Block ngắn: bỏ frame hiện tại, không xếp frame cũ vào socket.
       if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
         state.skippedFrames++;
         continue;
@@ -514,15 +514,23 @@ function broadcastFrame(frame) {
     }
 
     try {
-      let ok = res.write(header);
-      if (!res.write(frame)) ok = false;
-      if (!res.write(trailer)) ok = false;
-
-      state.lastSentSequence = frameSequence;
-      state.lastSentTime = now;
-      videoSentFrames++;
-
-      if (!ok) {
+      // Nếu socket đã đầy thì bỏ cả part trước khi ghi, tránh xếp JPEG cũ
+      // trong Node. Một part đã bắt đầu ghi phải luôn đủ header/JPEG/trailer.
+      if (res.writableNeedDrain) {
+        state.blocked = true;
+        state.blockedSince = now;
+        state.blockCount++;
+        res.once("drain", () => {
+          state.blocked = false;
+          state.blockedSince = 0;
+        });
+        state.skippedFrames++;
+        continue;
+      }
+      const headerOk = res.write(header);
+      const frameOk = res.write(frame);
+      const trailerOk = res.write(trailer);
+      if (!headerOk || !frameOk || !trailerOk) {
         state.blocked = true;
         state.blockedSince = now;
         state.blockCount++;
@@ -531,6 +539,10 @@ function broadcastFrame(frame) {
           state.blockedSince = 0;
         });
       }
+
+      state.lastSentSequence = frameSequence;
+      state.lastSentTime = now;
+      videoSentFrames++;
     } catch (error) {
       console.error("[VIDEO WRITE]", error.message);
       cleanupVideoClient(res);
