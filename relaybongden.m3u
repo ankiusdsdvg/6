@@ -1,6 +1,4 @@
 #EXTM3U
-#EXTINF:-1 tvg-id="ONVieDrama.vn@SD" tvg-logo="https://i.imgur.com/n7QICK7.png",ON Vie Drama (720p)
-http://dvrfl05.bozztv.com/vch_vchannel18/index.m3u8
 #EXTINF:-1 tvg-id="ONMovies.vn@SD" tvg-logo="https://i.imgur.com/765Y3jw.png",ON Movies (720p)
 https://freem3u.xyz/api/live/play.m3u8?vid=181
 #EXTINF:-1 tvg-id="ONLife.vn@SD" tvg-logo="https://i.imgur.com/2xT5HFx.png",ON Life (720p)
