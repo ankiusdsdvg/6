@@ -21,7 +21,7 @@ const VIDEO_FPS = 12;              // hình theo đúng yêu cầu API
 const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
-const JPEG_QUALITY = 8;
+const JPEG_QUALITY = 15;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const AUDIO_SAMPLE_RATE = 16000;
