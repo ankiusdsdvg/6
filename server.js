@@ -460,11 +460,19 @@ function clearVideoBuffer() {
   frameSequence = 0;
 }
 
-// Broadcast at the source cadence. Node's normal backpressure handling skips
-// blocked frames without tearing down a healthy audio/video session.
+// 🔥 BROADCAST VỚI TỰ PHỤC HỒI
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
   const now = Date.now();
+
+  const header = Buffer.from(
+    `--frame\r\n` +
+    `Content-Type: image/jpeg\r\n` +
+    `Content-Length: ${frame.length}\r\n` +
+    `\r\n`
+  );
+
+  const trailer = Buffer.from("\r\n");
 
   for (const [res, state] of videoClientsMap) {
     if (res.destroyed || res.writableEnded) {
@@ -472,15 +480,29 @@ function broadcastFrame(frame) {
       continue;
     }
 
+    // 🔥 Client đang block
     if (state.blocked) {
       const blockDuration = now - state.blockedSince;
+
+      // Block quá lâu → ngắt
       if (blockDuration > MAX_CLIENT_BLOCK_MS) {
+        console.log(
+          "[VIDEO] Slow client disconnected after",
+          blockDuration, "ms block (skipped:",
+          state.skippedFrames, ")"
+        );
         cleanupVideoClient(res);
         try { res.destroy(); } catch (_) {}
-      } else {
-        state.skippedFrames++;
+        continue;
       }
-      continue;
+
+      // Block > 300ms → BỎ FRAME này (tự phục hồi)
+      if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
+        state.skippedFrames++;
+        continue;
+      }
+
+      // Block < 300ms → thử ghi tiếp
     }
 
     if (state.lastSentSequence === frameSequence) continue;
@@ -491,17 +513,10 @@ function broadcastFrame(frame) {
       continue;
     }
 
-    const header = Buffer.from(
-      `--frame\r\n` +
-      `Content-Type: image/jpeg\r\n` +
-      `Content-Length: ${frame.length}\r\n` +
-      `\r\n`
-    );
-
     try {
       let ok = res.write(header);
       if (!res.write(frame)) ok = false;
-      if (!res.write("\r\n")) ok = false;
+      if (!res.write(trailer)) ok = false;
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
