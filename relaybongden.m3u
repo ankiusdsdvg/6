@@ -1,5 +1,5 @@
 #EXTM3U
-#EXTINF:-1 tvg-id="HTV5.vn@HD",HTV5 (1080p)
+#EXTINF:-1 tvg-id="htv5" tvg-logo="https://i.imgur.com/EI0mJRf.png" group-title="HTV",HTV5
 https://freem3u.xyz/api/live/play.m3u8?vid=151
 #EXTINF:-1 tvg-id="ONVieDrama.vn@SD",ON Vie Drama (720p)
 http://dvrfl05.bozztv.com/vch_vchannel18/index.m3u8
