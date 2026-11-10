@@ -108,6 +108,7 @@ let audioMaxObservedBytes = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
+let idleStopTimer = null;
 let lastVideoFrameTime = 0;
 let restarting = false;
 let manuallyStopped = true;
@@ -556,6 +557,7 @@ function cleanupVideoClient(res) {
 
   videoClientsMap.delete(res);
   videoClients = Math.max(0, videoClients - 1);
+  scheduleIdleStop();
 }
 
 function processVideoData(chunk, currentGeneration) {
@@ -645,7 +647,27 @@ function clearWatchdog() {
   }
 }
 
+function clearIdleStop() {
+  if (idleStopTimer) {
+    clearTimeout(idleStopTimer);
+    idleStopTimer = null;
+  }
+}
+
+function scheduleIdleStop() {
+  clearIdleStop();
+  if (!currentChannel || manuallyStopped || videoClientsMap.size || audioClient) return;
+  idleStopTimer = setTimeout(() => {
+    idleStopTimer = null;
+    if (!videoClientsMap.size && !audioClient && currentChannel && !manuallyStopped) {
+      stopFFmpeg();
+      currentChannel = null;
+    }
+  }, 3000);
+}
+
 function stopFFmpeg() {
+  clearIdleStop();
   generation++;
   manuallyStopped = true;
   restarting = false;
@@ -684,6 +706,7 @@ function startFFmpeg(channel) {
   }
 
   stopFFmpeg();
+  clearIdleStop();
 
   manuallyStopped = false;
   currentChannel = channel;
@@ -952,12 +975,14 @@ app.get("/audio", (req, res) => {
     if (audioClient === res) {
       console.log("[AUDIO] Client disconnected");
       disconnectAudioClient();
+      scheduleIdleStop();
     }
   });
 
   res.on("error", () => {
     if (audioClient === res) {
       disconnectAudioClient();
+      scheduleIdleStop();
     }
   });
 });
