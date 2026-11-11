@@ -1,13 +1,11 @@
 #EXTM3U
-#EXTINF:-1 tvg-id="ONVieDrama.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+Vie+Drama" group-title="ON",ON Vie Drama (720p)
-http://dvrfl05.bozztv.com/vch_vchannel18/index.m3u8
-#EXTINF:-1 tvg-id="ONMovies.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+Movies" group-title="ON",ON Movies (720p)
+#EXTINF:-1 tvg-id="ONMovies.vn@SD" tvg-logo="https://postimg.cc/pp83MS9S" group-title="ON",ON Movies (720p)
 https://freem3u.xyz/api/live/play.m3u8?vid=181
-#EXTINF:-1 tvg-id="ONLife.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+Life" group-title="ON",ON Life (720p)
+#EXTINF:-1 tvg-id="ONLife.vn@SD" tvg-logo="https://postimg.cc/bDWVK0qw" group-title="ON",ON Life (720p)
 https://freem3u.xyz/api/live/play.m3u8?vid=188
-#EXTINF:-1 tvg-id="ONKids.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+Kids" group-title="ON",ON Kids (720p)
+#EXTINF:-1 tvg-id="ONKids.vn@SD" tvg-logo="https://postimg.cc/67QHqb3p" group-title="ON",ON Kids (720p)
 https://freem3u.xyz/api/live/play.m3u8?vid=179
-#EXTINF:-1 tvg-id="HTV4.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=HTV4" group-title="HTV",HTV4 (1080p)
+#EXTINF:-1 tvg-id="HTV4.vn@SD" tvg-logo="https://postimg.cc/3dHnmxRt" group-title="HTV",HTV4 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=9
 #EXTINF:-1 tvg-id="DienBienTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=DIEN+BIEN+TV" group-title="Địa phương",Dien Bien TV (1080p)
 https://stream.langsontv.vn/live/2855dfeccb7f49a41a2b0441b3bfeda413c/playlist.m3u8
