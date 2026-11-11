@@ -7,6 +7,8 @@ https://freem3u.xyz/api/live/play.m3u8?vid=188
 https://freem3u.xyz/api/live/play.m3u8?vid=179
 #EXTINF:-1 tvg-id="HTV4.vn@SD" tvg-logo="https://postimg.cc/3dHnmxRt" group-title="HTV",HTV4 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=9
+#EXTINF:-1 tvg-id="htv5" tvg-logo="https://postimg.cc/R3RB5DYZ" group-title="HTV",HTV5 
+https://freem3u.xyz/api/live/play.m3u8?vid=151
 #EXTINF:-1 tvg-id="DienBienTV.vn@SD" tvg-logo="https://postimg.cc/hXt81zq3" group-title="Địa phương",Dien Bien TV (1080p)
 https://stream.langsontv.vn/live/2855dfeccb7f49a41a2b0441b3bfeda413c/playlist.m3u8
 #EXTINF:-1 tvg-id="CaoBangTV.vn@SD" tvg-logo="https://postimg.cc/rK8Z7pks" group-title="Địa phương",Cao Bằng TV (720p)
