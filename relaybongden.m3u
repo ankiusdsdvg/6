@@ -49,21 +49,21 @@ https://vmttv.dpdns.org/tv360/?id=vtv8
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/vtv9/playlist_360p.m3u
 #EXTINF:-1 tvg-id="DongNaiTV1.vn@SD" tvg-logo="https://postimg.cc/MnY6qHMf" group-title="Địa phương",Dong Nai TV 1 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=53
-#EXTINF:-1 tvg-id="QuangNamTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=QUANG+NAM+TV" group-title="Địa phương",Quang Nam TV
+#EXTINF:-1 tvg-id="QuangNamTV.vn@SD" tvg-logo="https://postimg.cc/0zfqw4Cq" group-title="Địa phương",Quang Nam TV
 https://freem3u.xyz/api/live/play.m3u8?vid=80
-#EXTINF:-1 tvg-id="DongNaiTV2.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=DONG+NAI+TV+2" group-title="Địa phương",Dong Nai TV 2 (1080p)
+#EXTINF:-1 tvg-id="DongNaiTV2.vn@SD" tvg-logo="https://postimg.cc/3Wv5BNZc" group-title="Địa phương",Dong Nai TV 2 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=255
-#EXTINF:-1 tvg-id="LangSonTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=LANG+SON+TV" group-title="Địa phương",Lang Son TV (720p) [Geo-blocked]
+#EXTINF:-1 tvg-id="LangSonTV.vn@SD" tvg-logo="https://postimg.cc/3dXssqVm" group-title="Địa phương",Lang Son TV (720p) [Geo-blocked]
 https://stream.langsontv.vn/live/285c78da0c246524c90917842f8de03bd21/playlist.m3u8
-#EXTINF:-1 tvg-id="AnNinhTV.vn@HD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ANTV" group-title="Địa phương",An Ninh TV HD (1080p)
+#EXTINF:-1 tvg-id="AnNinhTV.vn@HD" tvg-logo="https://postimg.cc/7GJcmtSD" group-title="Địa phương",An Ninh TV HD (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=20
-#EXTINF:-1 tvg-id="GiaLaiTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=GIA+LAI+TV" group-title="Địa phương",Gia Lai TV (720p)
+#EXTINF:-1 tvg-id="GiaLaiTV.vn@SD" tvg-logo="https://postimg.cc/p9hqHhrc" group-title="Địa phương",Gia Lai TV (720p)
 http://tldigital-17th06day-tl9648290.duckdns.org/tv.m3u8
-#EXTINF:-1 tvg-id="DongNaiTV1.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=DONG+NAI+TV+1" group-title="Địa phương",Dong Nai TV 1 (720p)
+#EXTINF:-1 tvg-id="DongNaiTV1.vn@SD" tvg-logo="https://postimg.cc/ykyGQZ3m" group-title="Địa phương",Dong Nai TV 1 (720p)
 https://vtvgolive-ott3.vtvdigital.vn/live/dongnai1tv/chunklist_2.m3u8
-#EXTINF:-1 tvg-id="ThaiNguyenTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=THAI+NGUYEN+TV" group-title="Địa phương",Thái Nguyên TV (720p)
+#EXTINF:-1 tvg-id="ThaiNguyenTV.vn@SD" tvg-logo="https://postimg.cc/cg7zpgkp" group-title="Địa phương",Thái Nguyên TV (720p)
 https://streaming.thainguyentv.vn/hls/livestream.m3u8
-#EXTINF:-1 tvg-id="TayNinhTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=TAY+NINH+TV" group-title="Địa phương",Tây Ninh TV (720p)
+#EXTINF:-1 tvg-id="TayNinhTV.vn@SD" tvg-logo="https://postimg.cc/nXsPHwwG" group-title="Địa phương",Tây Ninh TV (720p)
 https://live-hq.evgcdn.net/live/2851dc2c9af68834814a89e61db0faee561/chunklist.m3u8
 #EXTINF:-1 tvg-id="SCTV2.vn@SD" tvg-logo="https://i.imgur.com/sa5Ix86.png",SCTV2 (720p)
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/sctv2/master.m3u8
