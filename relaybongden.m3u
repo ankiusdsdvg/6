@@ -1,6 +1,4 @@
 #EXTM3U
-#EXTINF:-1 tvg-id="htv5" tvg-logo="https://i.imgur.com/EI0mJRf.png" group-title="HTV",HTV5
-https://freem3u.xyz/api/live/play.m3u8?vid=151
 #EXTINF:-1 tvg-id="ONVieDrama.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+Vie+Drama" group-title="ON",ON Vie Drama (720p)
 http://dvrfl05.bozztv.com/vch_vchannel18/index.m3u8
 #EXTINF:-1 tvg-id="ONMovies.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+Movies" group-title="ON",ON Movies (720p)
