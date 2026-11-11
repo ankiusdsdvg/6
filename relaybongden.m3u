@@ -7,28 +7,28 @@ https://freem3u.xyz/api/live/play.m3u8?vid=188
 https://freem3u.xyz/api/live/play.m3u8?vid=179
 #EXTINF:-1 tvg-id="HTV4.vn@SD" tvg-logo="https://postimg.cc/3dHnmxRt" group-title="HTV",HTV4 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=9
-#EXTINF:-1 tvg-id="DienBienTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=DIEN+BIEN+TV" group-title="Địa phương",Dien Bien TV (1080p)
+#EXTINF:-1 tvg-id="DienBienTV.vn@SD" tvg-logo="https://postimg.cc/hXt81zq3" group-title="Địa phương",Dien Bien TV (1080p)
 https://stream.langsontv.vn/live/2855dfeccb7f49a41a2b0441b3bfeda413c/playlist.m3u8
-#EXTINF:-1 tvg-id="CaoBangTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=CAO+BANG+TV" group-title="Địa phương",Cao Bằng TV (720p)
+#EXTINF:-1 tvg-id="CaoBangTV.vn@SD" tvg-logo="https://postimg.cc/rK8Z7pks" group-title="Địa phương",Cao Bằng TV (720p)
 https://stream.thingnet.vn/live/smil:CRTV.smil/chunklist.m3u8
-#EXTINF:-1 tvg-id="CaMauTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=CA+MAU+TV" group-title="Địa phương",Cà Mau TV (720p) [Geo-blocked]
+#EXTINF:-1 tvg-id="CaMauTV.vn@SD" tvg-logo="https://postimg.cc/14SvNz4M" group-title="Địa phương",Cà Mau TV (720p) [Geo-blocked]
 https://tv.ctvcamau.vn/live/tv/tv.m3u8
-#EXTINF:-1 tvg-id="ONEChannel.vn@HD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+E+CHANNEL" group-title="ON",ON E Channel (1080p)
+#EXTINF:-1 tvg-id="ONEChannel.vn@HD" tvg-logo="https://postimg.cc/XG49XpxP" group-title="ON",ON E Channel (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=182
-#EXTINF:-1 tvg-id="ONO2TV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+O2TV" group-title="ON",ON O2TV (1080p)
+#EXTINF:-1 tvg-id="ONO2TV.vn@SD" tvg-logo="https://postimg.cc/yWf0Y6RG" group-title="ON",ON O2TV (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=136
-#EXTINF:-1 tvg-id="ONVieGiaiTri.vn@HD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+VIE+GIAI+TRI" group-title="ON",ON Vie Giai Tri (1080p)
+#EXTINF:-1 tvg-id="ONVieGiaiTri.vn@HD" tvg-logo="https://postimg.cc/G8g9r2f3" group-title="ON",ON Vie Giai Tri (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=180
-#EXTINF:-1 tvg-id="ONMusic.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+MUSIC" group-title="ON",ON Music (1080p)
+#EXTINF:-1 tvg-id="ONMusic.vn@SD" tvg-logo="https://postimg.cc/fkkJCc3X" group-title="ON",ON Music (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=185
-#EXTINF:-1 tvg-id="ONCine.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=ON+CINE" group-title="ON",ON Cine
+#EXTINF:-1 tvg-id="ONCine.vn@SD" tvg-logo="https://postimg.cc/180tXMd7" group-title="ON",ON Cine
 https://freem3u.xyz/api/live/play.m3u8?vid=176
 #EXTINF:-1 tvg-id="vtv1hd" tvg-logo="https://i.postimg.cc/F1FvzstX/V1.png" group-title="VTV",VTV1
 https://luuchieu.truyenhinhso.vn/media/live/C90B082632CD4A75F4B3EDB3/index.m3u8
 #EXTINF:-1 tvg-id="vtv2hd" tvg-logo="https://i.postimg.cc/yDR4tDRm/V2.png" group-title="VTV",VTV2
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/vtv2/playlist_360p.m3u8
 #EXTINF:-1 tvg-id="vtv3hd" tvg-logo="https://i.postimg.cc/B8cWZRM0/V3.png" group-title="VTV",VTV3
-https://vmttv.dpdns.org/tv360/?id=vtv3
+https://vmttv.dpdns.org/tv360/?id=vtv3  
 #EXTINF:-1 tvg-id="vtv4hd" tvg-logo="https://i.postimg.cc/Wqzxnzj0/V4.png" group-title="VTV",VTV4
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/vtv4/playlist_360p.m3u8
 #EXTINF:-1 tvg-id="vtv5hd" tvg-logo="https://i.postimg.cc/ZC91vWVM/V5.png" group-title="VTV",VTV5
@@ -45,7 +45,7 @@ https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/vtv7/playlist_360p.m3u8
 https://vmttv.dpdns.org/tv360/?id=vtv8
 #EXTINF:-1 tvg-id="vtv9hd" tvg-logo="https://i.postimg.cc/phT0NSS6/V9.png" group-title="VTV",VTV9
 https://vtvgolive-sctvdrm.vtvdigital.vn/manifest/vtv9/playlist_360p.m3u
-#EXTINF:-1 tvg-id="DongNaiTV1.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=DONG+NAI+TV+1" group-title="Địa phương",Dong Nai TV 1 (1080p)
+#EXTINF:-1 tvg-id="DongNaiTV1.vn@SD" tvg-logo="https://postimg.cc/MnY6qHMf" group-title="Địa phương",Dong Nai TV 1 (1080p)
 https://freem3u.xyz/api/live/play.m3u8?vid=53
 #EXTINF:-1 tvg-id="QuangNamTV.vn@SD" tvg-logo="https://dummyimage.com/270x140/171717/ffffff.png&text=QUANG+NAM+TV" group-title="Địa phương",Quang Nam TV
 https://freem3u.xyz/api/live/play.m3u8?vid=80
