@@ -1,4 +1,3 @@
-
 const express = require("express");
 const { spawn } = require("child_process");
 
@@ -23,20 +22,7 @@ const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
 const JPEG_QUALITY = 10;
-const JPEG_QUALITY_720P = 15;
-const JPEG_QUALITY_540P = 20;
-const JPEG_QUALITY_340P = 25;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
-
-const QUALITY_PRESETS = Object.freeze([
-  Object.freeze({ id: "1080p", label: "1080p", jpegQuality: JPEG_QUALITY }),
-  Object.freeze({ id: "720p", label: "720p", jpegQuality: JPEG_QUALITY_720P }),
-  Object.freeze({ id: "540p", label: "540p", jpegQuality: JPEG_QUALITY_540P }),
-  Object.freeze({ id: "340p", label: "340p", jpegQuality: JPEG_QUALITY_340P })
-]);
-
-// 1080p/q10 giữ nguyên chất lượng mặc định trước đây.
-let currentQualityId = "1080p";
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
@@ -183,49 +169,6 @@ function filterChannelsByResolution(list, maxResolution = 720) {
   if (maxResolution === Number.MAX_SAFE_INTEGER) return list;
 
   return list.filter(c => !c.resolution || c.resolution <= maxResolution);
-}
-
-function normalizeQualityId(value) {
-  const raw = String(value || "").trim().toLowerCase().replace(/\s+/g, "");
-  if (!raw) return null;
-
-  const normalized = raw.endsWith("p") ? raw : `${raw}p`;
-  return QUALITY_PRESETS.some(preset => preset.id === normalized)
-    ? normalized
-    : null;
-}
-
-function getCurrentQualityPreset() {
-  return QUALITY_PRESETS.find(preset => preset.id === currentQualityId) || QUALITY_PRESETS[0];
-}
-
-function qualityResponse() {
-  const preset = getCurrentQualityPreset();
-
-  return {
-    quality: preset.id,
-    jpegQuality: preset.jpegQuality,
-    presets: QUALITY_PRESETS.map(item => ({
-      id: item.id,
-      label: item.label,
-      jpegQuality: item.jpegQuality
-    }))
-  };
-}
-
-function setQuality(value) {
-  const qualityId = normalizeQualityId(value);
-  if (!qualityId) return null;
-
-  const changed = qualityId !== currentQualityId;
-  currentQualityId = qualityId;
-
-  // Recreate FFmpeg so a running channel uses the new JPEG quality immediately.
-  if (changed && currentChannel && !manuallyStopped) {
-    startFFmpeg(currentChannel);
-  }
-
-  return getCurrentQualityPreset();
 }
 
 async function loadChannels() {
@@ -751,7 +694,6 @@ function startFFmpeg(channel) {
   videoSentFrames = 0;
 
   const currentGeneration = generation;
-  const qualityPreset = getCurrentQualityPreset();
 
   lastVideoFrameTime = Date.now();
 
@@ -759,7 +701,6 @@ function startFFmpeg(channel) {
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS} (max)`);
-  console.log("QUALITY:", qualityPreset.label, "JPEG q:", qualityPreset.jpegQuality);
   console.log("DEFAULT CLIENT FPS:", DEFAULT_CLIENT_FPS);
   console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
   console.log("MAX BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
@@ -793,7 +734,7 @@ function startFFmpeg(channel) {
     "-an",
     "-vf", videoFilter,
     "-c:v", "mjpeg",
-     "-q:v", String(qualityPreset.jpegQuality),
+    "-q:v", String(JPEG_QUALITY),
     "-threads", String(ENCODER_THREADS),
     "-r", String(VIDEO_FPS),
     "-fps_mode", "cfr",
@@ -1024,32 +965,6 @@ app.get("/audio", (req, res) => {
 // API CHANNELS
 // =====================================================
 
-function qualityConfigHandler(req, res) {
-  const requested = req.params.quality || req.body?.quality || req.query.quality;
-  const preset = requested === undefined
-    ? getCurrentQualityPreset()
-    : setQuality(requested);
-
-  if (!preset) {
-    return res.status(400).json({
-      success: false,
-      error: "Unsupported quality",
-      ...qualityResponse()
-    });
-  }
-
-  res.json({
-    success: true,
-    ...qualityResponse()
-  });
-}
-
-app.get("/api/config", qualityConfigHandler);
-app.get("/api/config/quality", qualityConfigHandler);
-app.get("/api/config/quality/:quality", qualityConfigHandler);
-app.post("/api/config/quality", qualityConfigHandler);
-app.post("/api/config/quality/:quality", qualityConfigHandler);
-
 app.get("/api/channels", (req, res) => {
   const requested =
     req.query.quality ||
@@ -1077,8 +992,6 @@ app.get("/api/channels", (req, res) => {
 
   res.json({
     success: true,
-    streamQuality: getCurrentQualityPreset().id,
-    jpegQuality: getCurrentQualityPreset().jpegQuality,
     quality: maxResolution === Number.MAX_SAFE_INTEGER
       ? "all"
       : String(maxResolution),
