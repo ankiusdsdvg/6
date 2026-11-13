@@ -58,7 +58,7 @@ const AUDIO_TARGET_MIN_MS = 700;
 const AUDIO_TARGET_MAX_MS = 1400;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
-// FIX: giảm thread để tránh tranh chấp CPU trên Termux
+// Giảm thread để tránh tranh chấp CPU trên Termux
 const DECODER_THREADS = 1;
 const ENCODER_THREADS = 1;
 
@@ -66,7 +66,7 @@ const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-// FIX: giảm buffer để giảm GC pressure trên Termux
+// Giảm buffer để giảm GC pressure trên Termux
 const MAX_VIDEO_BUFFER = 256 * 1024;
 const MAX_JPEG_FRAME_BYTES = 128 * 1024;
 
@@ -611,7 +611,6 @@ function processVideoData(chunk, currentGeneration) {
     videoInvalidFrames++;
   }
 
-  // FIX: tránh Buffer.concat toàn bộ khi overflow — tìm SOI trong chunk trước
   if (jpegPending.length + chunk.length > MAX_VIDEO_BUFFER) {
     const soiInChunk = chunk.lastIndexOf(JPEG_SOI);
 
@@ -770,18 +769,15 @@ function startFFmpeg(channel) {
     "-loglevel", "warning",
     "-nostdin",
 
-    // FIX: giảm độ trễ khởi động, tránh ffmpeg đọc ào ạt khi CPU yếu
-    "-fflags", "nobuffer+discardcorrupt+genpts",
+    // Tăng probesize/analyzeduration để nhận diện đủ stream HLS đa luồng
+    "-fflags", "+discardcorrupt+genpts",
     "-flags", "low_delay",
-    "-probesize", "32768",
-    "-analyzeduration", "0",
+    "-probesize", "5000000",
+    "-analyzeduration", "5000000",
 
     "-rw_timeout", "30000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
-    // FIX: tự phục hồi khi nguồn HLS ngắt giữa chừng
-    "-reconnect_at_eof", "1",
-    "-reconnect_on_network_error", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
 
@@ -790,8 +786,8 @@ function startFFmpeg(channel) {
     "-re",
     "-i", channel.url,
 
-    // OUTPUT 1: MJPEG VIDEO
-    "-map", "0:v:0?",
+    // OUTPUT 1: MJPEG VIDEO — chỉ lấy video đầu tiên
+    "-map", "0:v:0",
     "-an",
     "-vf", videoFilter,
     "-c:v", "mjpeg",
@@ -803,8 +799,8 @@ function startFFmpeg(channel) {
     "-f", "image2pipe",
     "pipe:1",
 
-    // OUTPUT 2: PCM AUDIO
-    "-map", "0:a:0?",
+    // OUTPUT 2: PCM AUDIO — chỉ lấy audio đầu tiên
+    "-map", "0:a:0",
     "-vn",
     "-af", `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.100:first_pts=0`,
     "-ac", String(AUDIO_CHANNELS),
