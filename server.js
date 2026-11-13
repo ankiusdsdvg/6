@@ -125,6 +125,13 @@ let lastVideoFrameTime = 0;
 let restarting = false;
 let manuallyStopped = true;
 
+// FIX: frame pacing — gửi đúng nhịp thay vì xả ào ạt
+let pacedFrameTimer = null;
+let pacedLatestFrame = null;
+let pacedLastSendTime = 0;
+let pacedFramesSent = 0;
+let pacedFramesDropped = 0;
+
 // =====================================================
 // PLAYLIST
 // =====================================================
@@ -506,13 +513,14 @@ function startAudioTimer() {
 }
 
 // =====================================================
-// VIDEO JPEG PARSER
+// VIDEO JPEG PARSER + FRAME PACING
 // =====================================================
 
 function clearVideoBuffer() {
   jpegPending = Buffer.alloc(0);
   latestFrame = null;
   frameSequence = 0;
+  stopFramePacing();
 }
 
 function broadcastFrame(frame) {
@@ -596,6 +604,48 @@ function broadcastFrame(frame) {
   }
 }
 
+// FIX: frame pacing — chỉ giữ frame mới nhất, gửi đúng nhịp VIDEO_FPS
+function queueFrameForPacing(frame) {
+  if (pacedLatestFrame) {
+    pacedFramesDropped++;
+  }
+
+  pacedLatestFrame = frame;
+
+  if (pacedFrameTimer) return;
+
+  const interval = 1000 / VIDEO_FPS;
+
+  const tick = () => {
+    if (!pacedLatestFrame) {
+      pacedFrameTimer = null;
+      return;
+    }
+
+    const now = Date.now();
+    const elapsed = now - pacedLastSendTime;
+
+    if (elapsed >= interval * 0.9) {
+      pacedLastSendTime = now;
+      pacedFramesSent++;
+      broadcastFrame(pacedLatestFrame);
+    }
+
+    pacedFrameTimer = setTimeout(tick, interval);
+  };
+
+  pacedFrameTimer = setTimeout(tick, 0);
+}
+
+function stopFramePacing() {
+  if (pacedFrameTimer) {
+    clearTimeout(pacedFrameTimer);
+    pacedFrameTimer = null;
+  }
+  pacedLatestFrame = null;
+  pacedLastSendTime = 0;
+}
+
 function cleanupVideoClient(res) {
   if (!videoClientsMap.has(res)) return;
 
@@ -674,7 +724,8 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
-    broadcastFrame(latestFrame);
+    // FIX: đưa vào hàng đợi pacing thay vì broadcast ngay
+    queueFrameForPacing(latestFrame);
 
     jpegPending = jpegPending.subarray(frameLength);
   }
@@ -704,6 +755,7 @@ function stopFFmpeg() {
   }
 
   disconnectAudioClient();
+  stopFramePacing();
 
   for (const res of videoClientsMap.keys()) {
     try { res.destroy(); } catch (_) {}
@@ -740,6 +792,8 @@ function startFFmpeg(channel) {
   videoDroppedFrames = 0;
   videoInvalidFrames = 0;
   videoSentFrames = 0;
+  pacedFramesSent = 0;
+  pacedFramesDropped = 0;
 
   const currentGeneration = generation;
   const qualityPreset = getCurrentQualityPreset();
@@ -755,7 +809,7 @@ function startFFmpeg(channel) {
   console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
   console.log("MAX BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-  console.log("MODE: -re input, -r output, per-client throttle, auto-recover");
+  console.log("MODE: -re input, -r output, frame pacing, auto-recover");
   console.log("==================================");
 
   const videoFilter = [
@@ -769,7 +823,6 @@ function startFFmpeg(channel) {
     "-loglevel", "warning",
     "-nostdin",
 
-    // Tăng probesize/analyzeduration để nhận diện đủ stream HLS đa luồng
     "-fflags", "+discardcorrupt+genpts",
     "-flags", "low_delay",
     "-probesize", "5000000",
@@ -786,7 +839,7 @@ function startFFmpeg(channel) {
     "-re",
     "-i", channel.url,
 
-    // OUTPUT 1: MJPEG VIDEO — chỉ lấy video đầu tiên
+    // OUTPUT 1: MJPEG VIDEO
     "-map", "0:v:0",
     "-an",
     "-vf", videoFilter,
@@ -799,7 +852,7 @@ function startFFmpeg(channel) {
     "-f", "image2pipe",
     "pipe:1",
 
-    // OUTPUT 2: PCM AUDIO — chỉ lấy audio đầu tiên
+    // OUTPUT 2: PCM AUDIO
     "-map", "0:a:0",
     "-vn",
     "-af", `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.100:first_pts=0`,
@@ -878,6 +931,7 @@ function scheduleRestart() {
   console.log("[RESTART] Waiting:", RESTART_DELAY);
 
   disconnectAudioClient();
+  stopFramePacing();
   clearVideoBuffer();
   clearWatchdog();
 
@@ -1383,7 +1437,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_MJPEG_PCM_AUTO_RECOVER",
+    pipeline: "REALTIME_MJPEG_PCM_FRAME_PACED",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1401,6 +1455,9 @@ app.get("/health", (req, res) => {
     videoFrameAge: lastVideoFrameTime
       ? Date.now() - lastVideoFrameTime
       : null,
+    pacedFramesSent,
+    pacedFramesDropped,
+    pacedActive: !!pacedFrameTimer,
     clientDetails,
 
     audioSampleRate: AUDIO_SAMPLE_RATE,
@@ -1439,12 +1496,15 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - AUTO RECOVER MJPEG + PCM\n" +
+    "IPTV SERVER RUNNING - FRAME PACED MJPEG + PCM\n" +
     "Usage:\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
-    "  /stream?fps=12       → 12 fps (ESP32 sẽ tự phục hồi)\n" +
+    "  /stream?fps=12       → 12 fps\n" +
     "  /stream?fps=6        → 6 fps\n" +
     "  /audio               → PCM audio\n" +
+    "\nFrame pacing:\n" +
+    "  - Frame mới nhất được giữ lại và gửi đúng nhịp " + VIDEO_FPS + " fps\n" +
+    "  - Frame đến dồn sẽ bị ghi đè (không gây tua)\n" +
     "\nAuto-recover:\n" +
     "  - Client block < " + CLIENT_SKIP_THRESHOLD_MS + "ms → gửi tiếp\n" +
     "  - Client block > " + CLIENT_SKIP_THRESHOLD_MS + "ms → bỏ frame, tự phục hồi\n" +
@@ -1469,7 +1529,7 @@ async function main() {
     console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
     console.log("MAX CLIENT BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
     console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-    console.log("PIPELINE: AUTO RECOVER MJPEG + PCM");
+    console.log("PIPELINE: FRAME PACED MJPEG + PCM");
     console.log("STREAM API: /stream?fps=N  (N = 1..30)");
     console.log("--------------------------------");
   });
