@@ -1,3 +1,4 @@
+
 const express = require("express");
 const { spawn } = require("child_process");
 
@@ -22,19 +23,34 @@ const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
 const JPEG_QUALITY = 10;
+const JPEG_QUALITY_720P = 15;
+const JPEG_QUALITY_540P = 20;
+const JPEG_QUALITY_340P = 25;
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
+
+const QUALITY_PRESETS = Object.freeze([
+  Object.freeze({ id: "1080p", label: "1080p", jpegQuality: JPEG_QUALITY }),
+  Object.freeze({ id: "720p", label: "720p", jpegQuality: JPEG_QUALITY_720P }),
+  Object.freeze({ id: "540p", label: "540p", jpegQuality: JPEG_QUALITY_540P }),
+  Object.freeze({ id: "340p", label: "340p", jpegQuality: JPEG_QUALITY_340P })
+]);
+
+// 1080p/q10 giữ nguyên chất lượng mặc định trước đây.
+let currentQualityId = "1080p";
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
-const AUDIO_FRAME_MS = 200;
+// Gói nhỏ hơn giúp client có nhịp dữ liệu đều, tránh mỗi lần timer chạy lại
+// dồn một burst PCM lớn làm video/decoder bị đói CPU.
+const AUDIO_FRAME_MS = 80;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 800;
-const AUDIO_BUFFER_MS = 800;
+const AUDIO_START_BUFFER_MS = 700;
+const AUDIO_BUFFER_MS = 1000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_BUFFER_MS / 1000;
@@ -43,7 +59,7 @@ let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
 const AUDIO_TARGET_MIN_MS = 700;
-const AUDIO_TARGET_MAX_MS = 1400;
+const AUDIO_TARGET_MAX_MS = 1000;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
 const DECODER_THREADS = 2;
@@ -57,7 +73,7 @@ const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 
 // 🔥 TỰ PHỤC HỒI CLIENT
-const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
+const CLIENT_SKIP_THRESHOLD_MS = 80;   // block ngắn vẫn tự phục hồi, không tạo burst
 const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
 
 const MAX_AUDIO_BLOCK_MS = 1500;
@@ -169,6 +185,49 @@ function filterChannelsByResolution(list, maxResolution = 720) {
   if (maxResolution === Number.MAX_SAFE_INTEGER) return list;
 
   return list.filter(c => !c.resolution || c.resolution <= maxResolution);
+}
+
+function normalizeQualityId(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/\s+/g, "");
+  if (!raw) return null;
+
+  const normalized = raw.endsWith("p") ? raw : `${raw}p`;
+  return QUALITY_PRESETS.some(preset => preset.id === normalized)
+    ? normalized
+    : null;
+}
+
+function getCurrentQualityPreset() {
+  return QUALITY_PRESETS.find(preset => preset.id === currentQualityId) || QUALITY_PRESETS[0];
+}
+
+function qualityResponse() {
+  const preset = getCurrentQualityPreset();
+
+  return {
+    quality: preset.id,
+    jpegQuality: preset.jpegQuality,
+    presets: QUALITY_PRESETS.map(item => ({
+      id: item.id,
+      label: item.label,
+      jpegQuality: item.jpegQuality
+    }))
+  };
+}
+
+function setQuality(value) {
+  const qualityId = normalizeQualityId(value);
+  if (!qualityId) return null;
+
+  const changed = qualityId !== currentQualityId;
+  currentQualityId = qualityId;
+
+  // Recreate FFmpeg so a running channel uses the new JPEG quality immediately.
+  if (changed && currentChannel && !manuallyStopped) {
+    startFFmpeg(currentChannel);
+  }
+
+  return getCurrentQualityPreset();
 }
 
 async function loadChannels() {
@@ -400,7 +459,10 @@ function audioTick() {
     console.warn("[AUDIO] Sender clock delayed:", elapsed, "ms");
   }
 
-  const framesToSend = Math.max(1, Math.round(elapsed / AUDIO_INTERVAL));
+  // Không gửi bù hàng loạt sau một lần event-loop bị trễ. Burst PCM làm
+  // client phải xử lý dồn và thường kéo theo giật hình; phần thiếu sẽ được
+  // bù bằng prebuffer/nhịp kế tiếp.
+  const framesToSend = Math.min(2, Math.max(1, Math.round(elapsed / AUDIO_INTERVAL)));
 
   for (let i = 0; i < framesToSend; i++) {
     if (!audioPrimed) {
@@ -498,7 +560,7 @@ function broadcastFrame(frame) {
         continue;
       }
 
-      // Block > 300ms → BỎ FRAME này (tự phục hồi)
+    // Client chậm: bỏ frame cũ thay vì chặn pipeline FFmpeg.
       if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
         state.skippedFrames++;
         continue;
@@ -509,23 +571,25 @@ function broadcastFrame(frame) {
 
     if (state.lastSentSequence === frameSequence) continue;
 
-    // Per-client throttle
-    if (state.clientInterval > 0) {
-      const timeSinceLastSend = now - state.lastSentTime;
-
-      if (timeSinceLastSend < state.clientInterval * 0.9) {
-        state.skippedFrames++;
-        continue;
-      }
+    // Phát theo deadline cố định. Cách so sánh với 90% interval cũ tạo jitter
+    // và có thể phát hai frame sát nhau sau một lần loop bị trễ.
+    if (state.nextSendAt > now) {
+      state.skippedFrames++;
+      continue;
     }
 
     try {
+      res.cork();
       let ok = res.write(header);
       if (!res.write(frame)) ok = false;
       if (!res.write(trailer)) ok = false;
+      res.uncork();
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
+      state.nextSendAt = state.clientInterval > 0
+        ? Math.max(now, state.nextSendAt) + state.clientInterval
+        : now;
       videoSentFrames++;
 
       if (!ok) {
@@ -538,6 +602,9 @@ function broadcastFrame(frame) {
         res.once("drain", () => {
           state.blocked = false;
           state.blockedSince = 0;
+          // Không phát bù một loạt frame sau khi socket thông; lấy frame mới
+          // nhất ở nhịp kế tiếp để giữ độ trễ thấp.
+          state.nextSendAt = Date.now();
         });
       }
 
@@ -694,6 +761,7 @@ function startFFmpeg(channel) {
   videoSentFrames = 0;
 
   const currentGeneration = generation;
+  const qualityPreset = getCurrentQualityPreset();
 
   lastVideoFrameTime = Date.now();
 
@@ -701,6 +769,7 @@ function startFFmpeg(channel) {
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS} (max)`);
+  console.log("QUALITY:", qualityPreset.label, "JPEG q:", qualityPreset.jpegQuality);
   console.log("DEFAULT CLIENT FPS:", DEFAULT_CLIENT_FPS);
   console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
   console.log("MAX BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
@@ -734,7 +803,7 @@ function startFFmpeg(channel) {
     "-an",
     "-vf", videoFilter,
     "-c:v", "mjpeg",
-    "-q:v", String(JPEG_QUALITY),
+     "-q:v", String(qualityPreset.jpegQuality),
     "-threads", String(ENCODER_THREADS),
     "-r", String(VIDEO_FPS),
     "-fps_mode", "cfr",
@@ -863,9 +932,9 @@ app.get("/stream", (req, res) => {
     );
   }
 
-  const clientInterval = clientFps >= VIDEO_FPS
-    ? 0
-    : (1000 / clientFps);
+  // Luôn giữ deadline cho từng client, kể cả khi xin FPS tối đa. Nếu để 0,
+  // nhiều frame từ cùng một chunk stdout có thể được ghi liên tiếp thành burst.
+  const clientInterval = 1000 / Math.min(clientFps, VIDEO_FPS);
 
   console.log(
     "[VIDEO] Client connected - requested fps:",
@@ -892,6 +961,7 @@ app.get("/stream", (req, res) => {
     clientFps,
     clientInterval,
     lastSentTime: 0,
+    nextSendAt: 0,
     skippedFrames: 0,
     blockCount: 0
   };
@@ -917,6 +987,7 @@ app.get("/stream", (req, res) => {
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = Date.now();
+      state.nextSendAt = Date.now() + (clientInterval > 0 ? clientInterval : 0);
       videoSentFrames++;
     } catch (_) {}
   }
@@ -965,6 +1036,32 @@ app.get("/audio", (req, res) => {
 // API CHANNELS
 // =====================================================
 
+function qualityConfigHandler(req, res) {
+  const requested = req.params.quality || req.body?.quality || req.query.quality;
+  const preset = requested === undefined
+    ? getCurrentQualityPreset()
+    : setQuality(requested);
+
+  if (!preset) {
+    return res.status(400).json({
+      success: false,
+      error: "Unsupported quality",
+      ...qualityResponse()
+    });
+  }
+
+  res.json({
+    success: true,
+    ...qualityResponse()
+  });
+}
+
+app.get("/api/config", qualityConfigHandler);
+app.get("/api/config/quality", qualityConfigHandler);
+app.get("/api/config/quality/:quality", qualityConfigHandler);
+app.post("/api/config/quality", qualityConfigHandler);
+app.post("/api/config/quality/:quality", qualityConfigHandler);
+
 app.get("/api/channels", (req, res) => {
   const requested =
     req.query.quality ||
@@ -992,6 +1089,8 @@ app.get("/api/channels", (req, res) => {
 
   res.json({
     success: true,
+    streamQuality: getCurrentQualityPreset().id,
+    jpegQuality: getCurrentQualityPreset().jpegQuality,
     quality: maxResolution === Number.MAX_SAFE_INTEGER
       ? "all"
       : String(maxResolution),
