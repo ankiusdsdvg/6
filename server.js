@@ -1,4 +1,3 @@
-
 const express = require("express");
 const { spawn } = require("child_process");
 
@@ -18,8 +17,8 @@ const M3U_URLS = [
 
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 240;
-const VIDEO_FPS = 12;              // FPS tối đa FFmpeg encode
-const DEFAULT_CLIENT_FPS = 12;      // FPS mặc định nếu client không xin
+const VIDEO_FPS = 12;
+const DEFAULT_CLIENT_FPS = 12;
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
 const JPEG_QUALITY = 10;
@@ -35,7 +34,6 @@ const QUALITY_PRESETS = Object.freeze([
   Object.freeze({ id: "340p", label: "340p", jpegQuality: JPEG_QUALITY_340P })
 ]);
 
-// 1080p/q10 giữ nguyên chất lượng mặc định trước đây.
 let currentQualityId = "1080p";
 
 const AUDIO_SAMPLE_RATE = 16000;
@@ -60,19 +58,20 @@ const AUDIO_TARGET_MIN_MS = 700;
 const AUDIO_TARGET_MAX_MS = 1400;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
-const DECODER_THREADS = 2;
+// FIX: giảm thread để tránh tranh chấp CPU trên Termux
+const DECODER_THREADS = 1;
 const ENCODER_THREADS = 1;
 
 const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-const MAX_VIDEO_BUFFER = 512 * 1024;
-const MAX_JPEG_FRAME_BYTES = 256 * 1024;
+// FIX: giảm buffer để giảm GC pressure trên Termux
+const MAX_VIDEO_BUFFER = 256 * 1024;
+const MAX_JPEG_FRAME_BYTES = 128 * 1024;
 
-// 🔥 TỰ PHỤC HỒI CLIENT
-const CLIENT_SKIP_THRESHOLD_MS = 300;   // block > 300ms → bỏ frame
-const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
+const CLIENT_SKIP_THRESHOLD_MS = 30;
+const MAX_CLIENT_BLOCK_MS = 3000;
 
 const MAX_AUDIO_BLOCK_MS = 1500;
 
@@ -104,7 +103,6 @@ let videoInvalidFrames = 0;
 let videoSentFrames = 0;
 let videoClients = 0;
 
-// Map: res -> state
 const videoClientsMap = new Map();
 
 let audioBuffer = Buffer.alloc(0);
@@ -220,7 +218,6 @@ function setQuality(value) {
   const changed = qualityId !== currentQualityId;
   currentQualityId = qualityId;
 
-  // Recreate FFmpeg so a running channel uses the new JPEG quality immediately.
   if (changed && currentChannel && !manuallyStopped) {
     startFFmpeg(currentChannel);
   }
@@ -518,7 +515,6 @@ function clearVideoBuffer() {
   frameSequence = 0;
 }
 
-// 🔥 BROADCAST VỚI TỰ PHỤC HỒI
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
 
@@ -539,11 +535,9 @@ function broadcastFrame(frame) {
       continue;
     }
 
-    // 🔥 Client đang block
     if (state.blocked) {
       const blockDuration = now - state.blockedSince;
 
-      // Block quá lâu → ngắt
       if (blockDuration > MAX_CLIENT_BLOCK_MS) {
         console.log(
           "[VIDEO] Slow client disconnected after",
@@ -555,18 +549,14 @@ function broadcastFrame(frame) {
         continue;
       }
 
-      // Block > 300ms → BỎ FRAME này (tự phục hồi)
       if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
         state.skippedFrames++;
         continue;
       }
-
-      // Block < 300ms → thử ghi tiếp
     }
 
     if (state.lastSentSequence === frameSequence) continue;
 
-    // Per-client throttle
     if (state.clientInterval > 0) {
       const timeSinceLastSend = now - state.lastSentTime;
 
@@ -621,13 +611,15 @@ function processVideoData(chunk, currentGeneration) {
     videoInvalidFrames++;
   }
 
+  // FIX: tránh Buffer.concat toàn bộ khi overflow — tìm SOI trong chunk trước
   if (jpegPending.length + chunk.length > MAX_VIDEO_BUFFER) {
-    const combined = Buffer.concat([jpegPending, chunk]);
-    const lastStart = combined.lastIndexOf(JPEG_SOI);
+    const soiInChunk = chunk.lastIndexOf(JPEG_SOI);
 
-    jpegPending = lastStart >= 0
-      ? Buffer.from(combined.subarray(lastStart))
-      : Buffer.alloc(0);
+    if (soiInChunk >= 0) {
+      jpegPending = Buffer.from(chunk.subarray(soiInChunk));
+    } else {
+      jpegPending = Buffer.alloc(0);
+    }
 
     videoInvalidFrames++;
 
@@ -777,12 +769,22 @@ function startFFmpeg(channel) {
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
+
+    // FIX: giảm độ trễ khởi động, tránh ffmpeg đọc ào ạt khi CPU yếu
+    "-fflags", "nobuffer+discardcorrupt+genpts",
+    "-flags", "low_delay",
+    "-probesize", "32768",
+    "-analyzeduration", "0",
+
     "-rw_timeout", "30000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
+    // FIX: tự phục hồi khi nguồn HLS ngắt giữa chừng
+    "-reconnect_at_eof", "1",
+    "-reconnect_on_network_error", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    "-fflags", "+discardcorrupt+genpts",
+
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
     "-re",
@@ -793,7 +795,7 @@ function startFFmpeg(channel) {
     "-an",
     "-vf", videoFilter,
     "-c:v", "mjpeg",
-     "-q:v", String(qualityPreset.jpegQuality),
+    "-q:v", String(qualityPreset.jpegQuality),
     "-threads", String(ENCODER_THREADS),
     "-r", String(VIDEO_FPS),
     "-fps_mode", "cfr",
@@ -908,7 +910,7 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM - HỖ TRỢ ?fps=xxx
+// VIDEO STREAM
 // =====================================================
 
 app.get("/stream", (req, res) => {
