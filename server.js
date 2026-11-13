@@ -71,7 +71,7 @@ const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 
 // 🔥 TỰ PHỤC HỒI CLIENT
-const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
+const CLIENT_SKIP_THRESHOLD_MS = 300;   // block > 300ms → bỏ frame
 const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
 
 const MAX_AUDIO_BLOCK_MS = 1500;
