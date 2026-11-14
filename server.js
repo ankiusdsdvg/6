@@ -94,8 +94,11 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 // VIDEO QUEUE / PRIMING / SYNC
 // =====================================================
 
-const VIDEO_QUEUE_TARGET = 12;   // ~1s buffer
-const VIDEO_QUEUE_MAX = 36;      // ~3s tối đa
+const VIDEO_QUEUE_TARGET = 12;   // ~1s buffer trước khi phát
+const VIDEO_QUEUE_MAX = 20;      // trần queue — giữ thấp để A/V bám nhau
+
+// Ngưỡng trim: nếu video queue "già" hơn audio buffer quá giá trị này → drop frame cũ
+const SYNC_TRIM_MS = 300;
 
 // Drift tối đa giữa audio và video (ms). Vượt ngưỡng → re-prime.
 const MAX_SYNC_DRIFT_MS = 800;
@@ -103,17 +106,15 @@ const MAX_SYNC_DRIFT_MS = 800;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_JolAxI55rXAodSTE5PaNlpGAq5A0";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
 
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbs5vb8n74is738ut5e0"
+  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
 const BANDWIDTH_LIMIT_GB = Number(
   process.env.BANDWIDTH_LIMIT_GB || 5
 );
-
 
 // =====================================================
 // GLOBAL STATE
@@ -642,10 +643,8 @@ function audioTick() {
     return;
   }
 
-  // Chưa có video primed → chưa phát để tránh lệch từ đầu
   if (!videoPrimed) return;
 
-  // Cả hai đã primed → đặt mốc sync nếu chưa có
   if (syncEpoch === 0) {
     syncEpoch = Date.now();
     audioNextTickTime = syncEpoch + AUDIO_INTERVAL;
@@ -689,7 +688,6 @@ function scheduleAudioTick() {
   audioTimer = setTimeout(() => {
     audioNextTickTime += AUDIO_INTERVAL;
 
-    // Trễ quá 2 interval → resync (tránh burst catch-up)
     if (Date.now() - audioNextTickTime > AUDIO_INTERVAL * 2) {
       audioNextTickTime = Date.now() + AUDIO_INTERVAL;
     }
@@ -996,6 +994,20 @@ function processVideoData(chunk, currentGeneration) {
 
     lastVideoFrameReceived = Date.now();
 
+    // === SYNC TRIM ===
+    // Nếu video queue đang "già" hơn audio buffer quá SYNC_TRIM_MS
+    // → drop frame cũ nhất để video content age bám sát audio.
+    if (videoPrimed && audioPrimed) {
+      const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
+      const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
+
+      if (videoBufMs > audioBufMs + SYNC_TRIM_MS) {
+        videoQueue.shift();
+        videoDroppedFrames++;
+      }
+    }
+    // =================
+
     videoQueue.push(frame);
 
     if (videoQueue.length > VIDEO_QUEUE_MAX) {
@@ -1108,8 +1120,10 @@ function startFFmpeg(channel) {
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
   console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
+  console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
+  console.log("SYNC TRIM THRESHOLD:", SYNC_TRIM_MS, "ms");
   console.log("MAX SYNC DRIFT:", MAX_SYNC_DRIFT_MS, "ms");
-  console.log("MODE: -re + SYNC EPOCH + DRIFT MONITOR");
+  console.log("MODE: -re + SYNC EPOCH + CONTENT TRIM");
   console.log("==================================");
 
   const videoFilter = [
@@ -1154,8 +1168,6 @@ function startFFmpeg(channel) {
     "pipe:1",
 
     // OUTPUT 2: PCM AUDIO
-    // async=100 (thay vì 1000) — giảm 10x tốc độ compensate drift
-    // min_hard_comp=0.500 — chỉ drop khi lệch > 500ms
     "-map", "0:a:0?",
     "-vn",
     "-af",
@@ -1866,6 +1878,9 @@ app.get("/health", (req, res) => {
   const audioMs = audioFramesSinceSync * AUDIO_FRAME_MS;
   const videoMs = videoFramesSinceSync * VIDEO_INTERVAL;
 
+  const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
+  const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
+
   res.json({
     status: "running",
 
@@ -1878,7 +1893,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_READ + SYNC_EPOCH + DRIFT_MONITOR",
+    pipeline: "REALTIME_READ + SYNC_EPOCH + CONTENT_TRIM",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1891,6 +1906,7 @@ app.get("/health", (req, res) => {
     videoQueueLength: videoQueue.length,
     videoQueueTarget: VIDEO_QUEUE_TARGET,
     videoQueueMax: VIDEO_QUEUE_MAX,
+    syncTrimMs: SYNC_TRIM_MS,
 
     videoDroppedFrames,
     videoInvalidFrames,
@@ -1924,6 +1940,10 @@ app.get("/health", (req, res) => {
       maxDriftMs: MAX_SYNC_DRIFT_MS
     },
 
+    // Đây mới là chỉ số A/V lệch thực tế mà tai–mắt cảm nhận được.
+    // Dương = video trễ hơn audio. Âm = video sớm hơn audio.
+    contentOffsetMs: Math.round(videoBufMs - audioBufMs),
+
     audioSampleRate: AUDIO_SAMPLE_RATE,
     audioChannels: AUDIO_CHANNELS,
     audioFrameBytes: AUDIO_FRAME_BYTES,
@@ -1932,14 +1952,7 @@ app.get("/health", (req, res) => {
     audioBufferBytes: audioBuffer.length,
     audioBufferMax: AUDIO_BUFFER_MAX,
 
-    audioBufferMs: Math.round(
-      audioBuffer.length /
-      (
-        AUDIO_SAMPLE_RATE *
-        AUDIO_CHANNELS *
-        AUDIO_BYTES_PER_SAMPLE
-      ) * 1000
-    ),
+    audioBufferMs: Math.round(audioBufMs),
 
     audioStartBufferMs: AUDIO_START_BUFFER_MS,
     audioTargetBufferMs,
@@ -1993,7 +2006,7 @@ app.get("/", (req, res) => {
     "  /stream?fps=6        → 6 fps\n" +
     "  /audio               → PCM audio\n" +
     "\nPlayback starts after both primed, on a shared epoch.\n" +
-    "Drift monitor re-primes if |audio-video| > " + MAX_SYNC_DRIFT_MS + "ms."
+    "Content trim keeps |video-age - audio-age| <= " + SYNC_TRIM_MS + "ms."
   );
 });
 
@@ -2024,9 +2037,11 @@ async function main() {
       `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`
     );
     console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
+    console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
     console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
+    console.log("SYNC TRIM THRESHOLD:", SYNC_TRIM_MS, "ms");
     console.log("MAX SYNC DRIFT:", MAX_SYNC_DRIFT_MS, "ms");
-    console.log("PIPELINE: -re + SYNC EPOCH + DRIFT MONITOR");
+    console.log("PIPELINE: -re + SYNC EPOCH + CONTENT TRIM");
     console.log("--------------------------------");
   });
 
