@@ -26,6 +26,8 @@ const JPEG_QUALITY = 10;
 const JPEG_QUALITY_720P = 15;
 const JPEG_QUALITY_540P = 20;
 const JPEG_QUALITY_340P = 25;
+
+// Broadcast video đúng nhịp VIDEO_FPS — không phụ thuộc burst từ FFmpeg
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const QUALITY_PRESETS = Object.freeze([
@@ -59,12 +61,11 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Buffer khởi động — tăng lên 1000ms so với gốc 500ms
-// để hấp thụ burst của FFmpeg trong ~1-2s đầu.
+// Prebuffer khởi động — 1000ms.
+// Kết hợp với -re, buffer sẽ đầy đều đặn trong ~1s.
 const AUDIO_START_BUFFER_MS = 1000;
 
-// Buffer tối đa — tăng lên 3500ms so với gốc 2000ms.
-// Đủ chịu burst HLS mà không lo overflow.
+// Buffer tối đa — 3500ms, đủ rộng cho jitter nhỏ.
 const AUDIO_BUFFER_MS = 3500;
 
 const AUDIO_BUFFER_MAX =
@@ -78,7 +79,6 @@ let audioStableFrames = 0;
 
 const AUDIO_TARGET_MIN_MS = 500;
 const AUDIO_TARGET_MAX_MS = 1400;
-
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
 const DECODER_THREADS = 2;
@@ -94,6 +94,15 @@ const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 const CLIENT_SKIP_THRESHOLD_MS = 300;
 const MAX_CLIENT_BLOCK_MS = 3000;
 const MAX_AUDIO_BLOCK_MS = 1500;
+
+// =====================================================
+// VIDEO QUEUE / PRIMING
+// =====================================================
+// Hàng đợi frame video — broadcast đúng 12fps từ đây.
+// Nhờ vậy burst từ FFmpeg bị "san phẳng" thành 12fps đều.
+
+const VIDEO_QUEUE_TARGET = 12;   // ~1s buffer trước khi phát
+const VIDEO_QUEUE_MAX = 36;      // ~3s tối đa, tránh latency tích tụ
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
@@ -121,6 +130,10 @@ let latestFrame = null;
 let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
+let videoQueue = [];
+let videoPrimed = false;
+let videoBroadcastTimer = null;
+
 let videoDroppedFrames = 0;
 let videoInvalidFrames = 0;
 let videoSentFrames = 0;
@@ -141,14 +154,18 @@ let audioFramesSent = 0;
 let audioSilenceSent = 0;
 let audioPrimed = false;
 let audioSilenceBytes = 0;
+let audioMaxObservedBytes = 0;
 
-// Timer dùng thời gian tuyệt đối để chống trôi
 let audioNextTickTime = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
 
+// Thời điểm nhận frame cuối từ FFmpeg (dùng cho watchdog)
+let lastVideoFrameReceived = 0;
+// Thời điểm broadcast frame cuối ra client (dùng cho client state)
 let lastVideoFrameTime = 0;
+
 let restarting = false;
 let manuallyStopped = true;
 
@@ -334,6 +351,7 @@ function resetAudioState(resetStats = false) {
   audioStableFrames = 0;
   audioTargetBufferMs = AUDIO_START_BUFFER_MS;
   audioNextTickTime = 0;
+  audioMaxObservedBytes = 0;
 
   if (resetStats) {
     audioUnderflows = 0;
@@ -431,14 +449,16 @@ function pushAudioBuffer(chunk) {
       audioBuffer.subarray(1)
     );
   }
+
+  if (audioBuffer.length > audioMaxObservedBytes) {
+    audioMaxObservedBytes = audioBuffer.length;
+  }
 }
 
 function makeSilenceFrame() {
   return Buffer.alloc(AUDIO_FRAME_BYTES, 0);
 }
 
-// Logic gốc: luôn lấy tối đa AUDIO_FRAME_BYTES mỗi tick.
-// Nếu thiếu → zero-pad (đây là underflow thật, không phải adaptive).
 function takeAudioFrame() {
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
 
@@ -559,7 +579,7 @@ function audioTick() {
     audioPrimed = true;
 
     console.log(
-      "[AUDIO] Prebuffer ready:",
+      "[AUDIO] Primed:",
       audioBuffer.length,
       "bytes / target:",
       audioTargetBufferMs,
@@ -572,8 +592,6 @@ function audioTick() {
   writeAudioFrame(frame, false);
 }
 
-// Dùng thời gian tuyệt đối — nếu event loop bận,
-// frame sau được đặt đúng vào mốc kế tiếp thay vì cộng dồn độ trễ.
 function scheduleAudioTick() {
   if (
     !audioClient ||
@@ -595,7 +613,6 @@ function scheduleAudioTick() {
   audioTimer = setTimeout(() => {
     audioNextTickTime += AUDIO_INTERVAL;
 
-    // Nếu trễ quá 1 frame → resync, tránh dồn hàng loạt tick
     if (Date.now() - audioNextTickTime > AUDIO_INTERVAL) {
       audioNextTickTime = Date.now() + AUDIO_INTERVAL;
     }
@@ -616,13 +633,52 @@ function startAudioTimer() {
 }
 
 // =====================================================
-// VIDEO JPEG PARSER
+// VIDEO QUEUE / PACED BROADCAST
 // =====================================================
 
 function clearVideoBuffer() {
   jpegPending = Buffer.alloc(0);
   latestFrame = null;
   frameSequence = 0;
+  videoQueue = [];
+  videoPrimed = false;
+}
+
+// Chạy mỗi VIDEO_INTERVAL (83ms) — lấy frame từ queue và phát.
+// Không phát khi queue chưa đủ dày (priming) → "khi đã ổn định mới phát".
+function videoBroadcastTick() {
+  if (!videoQueue.length) return;
+
+  if (!videoPrimed) {
+    if (videoQueue.length >= VIDEO_QUEUE_TARGET) {
+      videoPrimed = true;
+      console.log(
+        "[VIDEO] Primed with", videoQueue.length, "frames → start broadcast"
+      );
+    } else {
+      return;
+    }
+  }
+
+  const frame = videoQueue.shift();
+
+  if (!frame) return;
+
+  latestFrame = frame;
+  frameSequence++;
+  lastVideoFrameTime = Date.now();
+
+  broadcastFrame(frame);
+}
+
+function startVideoBroadcastTimer() {
+  if (videoBroadcastTimer) {
+    clearInterval(videoBroadcastTimer);
+  }
+  videoBroadcastTimer = setInterval(
+    videoBroadcastTick,
+    VIDEO_INTERVAL
+  );
 }
 
 function broadcastFrame(frame) {
@@ -732,6 +788,8 @@ function cleanupVideoClient(res) {
   videoClients = Math.max(0, videoClients - 1);
 }
 
+// Parse JPEG từ pipe, đẩy vào queue. KHÔNG broadcast tại đây —
+// broadcast do videoBroadcastTick đảm nhiệm với nhịp cố định.
 function processVideoData(chunk, currentGeneration) {
   if (
     currentGeneration !== generation ||
@@ -817,14 +875,18 @@ function processVideoData(chunk, currentGeneration) {
       continue;
     }
 
-    latestFrame = Buffer.from(
+    const frame = Buffer.from(
       jpegPending.subarray(0, frameLength)
     );
 
-    frameSequence++;
-    lastVideoFrameTime = Date.now();
+    lastVideoFrameReceived = Date.now();
 
-    broadcastFrame(latestFrame);
+    videoQueue.push(frame);
+
+    if (videoQueue.length > VIDEO_QUEUE_MAX) {
+      videoQueue.shift();
+      videoDroppedFrames++;
+    }
 
     jpegPending = jpegPending.subarray(frameLength);
   }
@@ -910,6 +972,7 @@ function startFFmpeg(channel) {
   const currentGeneration = generation;
   const qualityPreset = getCurrentQualityPreset();
 
+  lastVideoFrameReceived = Date.now();
   lastVideoFrameTime = Date.now();
 
   console.log("\n==================================");
@@ -931,7 +994,9 @@ function startFFmpeg(channel) {
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
   console.log("AUDIO MAX BUFFER:", AUDIO_BUFFER_MS, "ms");
-  console.log("MODE: LOW LATENCY INPUT + ADAPTIVE PCM");
+  console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
+  console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
+  console.log("MODE: -re REAL-TIME READ + PACED BROADCAST");
   console.log("==================================");
 
   const videoFilter = [
@@ -954,10 +1019,11 @@ function startFFmpeg(channel) {
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
 
-    "-fflags", "+discardcorrupt+genpts+nobuffer",
-    "-flags", "low_delay",
-    "-max_delay", "500000",
+    // Đọc input đúng 1x — KHÔNG đọc ồ ạt burst.
+    // Đây là fix chính cho việc audio/video bị glitch 10-15s.
+    "-re",
 
+    "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
 
@@ -1056,11 +1122,11 @@ function startFFmpeg(channel) {
     }
 
     const elapsed =
-      Date.now() - lastVideoFrameTime;
+      Date.now() - lastVideoFrameReceived;
 
     if (elapsed > VIDEO_TIMEOUT) {
       console.log(
-        "[WATCHDOG] No video frame for",
+        "[WATCHDOG] No video frame received for",
         elapsed,
         "ms"
       );
@@ -1167,7 +1233,10 @@ app.get("/stream", (req, res) => {
 
   videoClientsMap.set(res, state);
 
+  // Chỉ gửi frame khởi động nếu video đã primed.
+  // Nếu chưa, client sẽ nhận frame đầu tiên khi broadcast tick tiếp theo sau prime.
   if (
+    videoPrimed &&
     latestFrame &&
     Date.now() - lastVideoFrameTime <= 1500 &&
     frameSequence > 0
@@ -1223,7 +1292,7 @@ app.get("/audio", (req, res) => {
   res.setHeader("Content-Encoding", "identity");
 
   console.log(
-    "[AUDIO] Client connected; sending silence until prebuffer ready"
+    "[AUDIO] Client connected; silence until primed"
   );
 
   startAudioTimer();
@@ -1695,7 +1764,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_MJPEG_PCM_AUTO_RECOVER",
+    pipeline: "REALTIME_READ_MJPEG_PCM_PACED",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1703,6 +1772,11 @@ app.get("/health", (req, res) => {
     defaultClientFps: DEFAULT_CLIENT_FPS,
     skipThresholdMs: CLIENT_SKIP_THRESHOLD_MS,
     maxClientBlockMs: MAX_CLIENT_BLOCK_MS,
+
+    videoPrimed,
+    videoQueueLength: videoQueue.length,
+    videoQueueTarget: VIDEO_QUEUE_TARGET,
+    videoQueueMax: VIDEO_QUEUE_MAX,
 
     videoDroppedFrames,
     videoInvalidFrames,
@@ -1716,7 +1790,11 @@ app.get("/health", (req, res) => {
 
     videoFrameSequence: frameSequence,
 
-    videoFrameAge: lastVideoFrameTime
+    videoFrameAge: lastVideoFrameReceived
+      ? Date.now() - lastVideoFrameReceived
+      : null,
+
+    videoLastBroadcastAge: lastVideoFrameTime
       ? Date.now() - lastVideoFrameTime
       : null,
 
@@ -1742,6 +1820,7 @@ app.get("/health", (req, res) => {
     audioStartBufferMs: AUDIO_START_BUFFER_MS,
     audioTargetBufferMs,
     audioPrimed,
+    audioMaxObservedBytes,
 
     audioClientConnected:
       !!audioClient && !audioClient.destroyed,
@@ -1771,6 +1850,7 @@ app.get("/health", (req, res) => {
       )
     },
 
+    lastVideoFrameReceived,
     lastVideoFrameTime,
     generation
   });
@@ -1782,12 +1862,15 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - AUTO RECOVER MJPEG + PCM\n" +
+    "IPTV SERVER RUNNING - REAL-TIME READ + PACED BROADCAST\n" +
     "Usage:\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
     "  /stream?fps=6        → 6 fps\n" +
     "  /audio               → PCM audio\n" +
+    "\nPlayback starts only after:\n" +
+    "  - Audio buffer >= " + AUDIO_START_BUFFER_MS + "ms\n" +
+    "  - Video queue >= " + VIDEO_QUEUE_TARGET + " frames\n" +
     "\nAuto-recover:\n" +
     "  - Client block < " + CLIENT_SKIP_THRESHOLD_MS + "ms → send tiếp\n" +
     "  - Client block > " + CLIENT_SKIP_THRESHOLD_MS + "ms → bỏ frame\n" +
@@ -1810,6 +1893,9 @@ async function main() {
     );
   }
 
+  // Video broadcast pacing — chạy suốt vòng đời server
+  startVideoBroadcastTimer();
+
   app.listen(PORT, "0.0.0.0", () => {
     console.log("--------------------------------");
     console.log("IPTV SERVER RUNNING");
@@ -1827,20 +1913,9 @@ async function main() {
     );
 
     console.log(
-      "SKIP THRESHOLD:",
-      CLIENT_SKIP_THRESHOLD_MS,
-      "ms"
-    );
-
-    console.log(
-      "MAX CLIENT BLOCK:",
-      MAX_CLIENT_BLOCK_MS,
-      "ms"
-    );
-
-    console.log(
-      "AUDIO:",
-      `${AUDIO_SAMPLE_RATE}Hz mono PCM`
+      "VIDEO QUEUE TARGET:",
+      VIDEO_QUEUE_TARGET,
+      "frames"
     );
 
     console.log(
@@ -1856,11 +1931,7 @@ async function main() {
     );
 
     console.log(
-      "PIPELINE: AUTO RECOVER MJPEG + PCM"
-    );
-
-    console.log(
-      "STREAM API: /stream?fps=N (N = 1..30)"
+      "PIPELINE: -re + PACED BROADCAST"
     );
 
     console.log("--------------------------------");
