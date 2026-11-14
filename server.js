@@ -59,11 +59,12 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Prebuffer lớn hơn — hấp thụ burst ban đầu của FFmpeg
-const AUDIO_START_BUFFER_MS = 1500;
+// Prebuffer đủ lớn để hấp thụ burst ban đầu của FFmpeg.
+// Nhỏ hơn = khởi động nhanh nhưng dễ underflow vài giây đầu.
+const AUDIO_START_BUFFER_MS = 1000;
 
-// Buffer tối đa lớn hơn để chịu burst + catch-up
-const AUDIO_BUFFER_MS = 3000;
+// Buffer tối đa — đủ rộng để chịu burst HLS.
+const AUDIO_BUFFER_MS = 4000;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -74,17 +75,9 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 800;
-const AUDIO_TARGET_MAX_MS = 2000;
-
-// Hạ target nhanh hơn sau khi ổn định (~5s thay vì 10s)
-const AUDIO_STABLE_FRAMES_TO_REDUCE = 25;
-
-// Adaptive consumption — giảm tốc độ "ăn" khi buffer thấp
-const AUDIO_LOW_BUFFER_MS = 500;
-const AUDIO_LOW_FACTOR = 0.75;   // 150ms/200ms
-const AUDIO_MID_BUFFER_MS = 1000;
-const AUDIO_MID_FACTOR = 0.9;    // 180ms/200ms
+const AUDIO_TARGET_MIN_MS = 500;
+const AUDIO_TARGET_MAX_MS = 1500;
+const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
@@ -101,11 +94,13 @@ const CLIENT_SKIP_THRESHOLD_MS = 300;
 const MAX_CLIENT_BLOCK_MS = 3000;
 const MAX_AUDIO_BLOCK_MS = 1500;
 
+// Khi FFmpeg tạm dừng sản xuất frame, resend frame cuối để client không timeout
+const VIDEO_KEEPALIVE_MS = 500;
+const VIDEO_KEEPALIVE_INTERVAL = 250;
+
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-// Render API: nên cấu hình RENDER_API_KEY trong Environment.
-// Không lưu API key trực tiếp trong source code.
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
 
 const RENDER_SERVICE_IDS = (
@@ -135,6 +130,7 @@ let videoSentFrames = 0;
 let videoClients = 0;
 
 const videoClientsMap = new Map();
+let videoKeepaliveTimer = null;
 
 let audioBuffer = Buffer.alloc(0);
 let audioClient = null;
@@ -451,40 +447,33 @@ function makeSilenceFrame() {
   return Buffer.alloc(AUDIO_FRAME_BYTES, 0);
 }
 
+// Luôn tiêu thụ đúng AUDIO_FRAME_BYTES mỗi tick (200ms).
+// Nếu buffer thiếu → zero-pad (đây là underflow THẬT, không phải adaptive).
 function takeAudioFrame() {
-  const bufferMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
-
-  // Khi buffer thấp → "ăn" ít hơn để buffer kịp hồi
-  let consumeBytes = AUDIO_FRAME_BYTES;
-
-  if (bufferMs < AUDIO_LOW_BUFFER_MS) {
-    consumeBytes = Math.floor(AUDIO_FRAME_BYTES * AUDIO_LOW_FACTOR) & ~1;
-  } else if (bufferMs < AUDIO_MID_BUFFER_MS) {
-    consumeBytes = Math.floor(AUDIO_FRAME_BYTES * AUDIO_MID_FACTOR) & ~1;
-  }
-
-  const available = Math.min(audioBuffer.length, consumeBytes) & ~1;
-
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
 
-  if (available > 0) {
-    audioBuffer.copy(frame, 0, 0, available);
-    audioBuffer = audioBuffer.subarray(available);
+  const count = Math.min(
+    audioBuffer.length,
+    AUDIO_FRAME_BYTES
+  ) & ~1;
+
+  if (count > 0) {
+    audioBuffer.copy(frame, 0, 0, count);
+    audioBuffer = audioBuffer.subarray(count);
   }
 
-  if (available < AUDIO_FRAME_BYTES) {
-    audioSilenceBytes += AUDIO_FRAME_BYTES - available;
+  if (count < AUDIO_FRAME_BYTES) {
+    audioUnderflows++;
 
-    // Chỉ tăng target khi thực sự thiếu so với mức tiêu thụ
-    if (available < consumeBytes) {
-      audioUnderflows++;
-      audioStableFrames = 0;
+    audioSilenceBytes +=
+      AUDIO_FRAME_BYTES - count;
 
-      audioTargetBufferMs = Math.min(
-        AUDIO_TARGET_MAX_MS,
-        audioTargetBufferMs + 100
-      );
-    }
+    audioStableFrames = 0;
+
+    audioTargetBufferMs = Math.min(
+      AUDIO_TARGET_MAX_MS,
+      audioTargetBufferMs + 100
+    );
 
   } else {
     audioStableFrames++;
@@ -614,7 +603,7 @@ function scheduleAudioTick() {
   audioTimer = setTimeout(() => {
     audioNextTickTime += AUDIO_INTERVAL;
 
-    // Nếu bị trễ quá 1 frame (event loop bận) → resync
+    // Nếu trễ quá 1 frame do event loop bận → resync lại
     if (Date.now() - audioNextTickTime > AUDIO_INTERVAL) {
       audioNextTickTime = Date.now() + AUDIO_INTERVAL;
     }
@@ -643,8 +632,6 @@ function clearVideoBuffer() {
   latestFrame = null;
   frameSequence = 0;
 }
-
-// BROADCAST VỚI TỰ PHỤC HỒI CLIENT
 
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
@@ -751,6 +738,47 @@ function cleanupVideoClient(res) {
 
   videoClientsMap.delete(res);
   videoClients = Math.max(0, videoClients - 1);
+}
+
+// Khi FFmpeg tạm ngưng sản xuất frame (HLS gap, hiccup mạng…)
+// resend frame cuối để client (ESP32/browser) không bị timeout.
+function startVideoKeepalive() {
+  if (videoKeepaliveTimer) return;
+
+  videoKeepaliveTimer = setInterval(() => {
+    if (!latestFrame || !videoClientsMap.size) return;
+
+    const now = Date.now();
+
+    for (const [res, state] of videoClientsMap) {
+      if (res.destroyed || res.writableEnded) {
+        cleanupVideoClient(res);
+        continue;
+      }
+
+      if (state.blocked) continue;
+      if (state.lastSentTime === 0) continue;
+      if (now - state.lastSentTime < VIDEO_KEEPALIVE_MS) continue;
+
+      try {
+        const header = Buffer.from(
+          `--frame\r\n` +
+          `Content-Type: image/jpeg\r\n` +
+          `Content-Length: ${latestFrame.length}\r\n` +
+          `\r\n`
+        );
+
+        res.write(header);
+        res.write(latestFrame);
+        res.write("\r\n");
+
+        state.lastSentTime = now;
+      } catch (_) {
+        cleanupVideoClient(res);
+        try { res.destroy(); } catch (_) {}
+      }
+    }
+  }, VIDEO_KEEPALIVE_INTERVAL);
 }
 
 function processVideoData(chunk, currentGeneration) {
@@ -862,20 +890,6 @@ function clearWatchdog() {
   }
 }
 
-/*
- * manual = true:
- *   Người dùng chủ động dừng server/kênh.
- *
- * disconnectClients = true:
- *   Ngắt các client khi người dùng chủ động stop.
- *
- * Khi đổi kênh:
- *   manual = false
- *   disconnectClients = false
- *
- * Nhờ vậy ESP32 không phải kết nối lại /stream và /audio.
- */
-
 function stopFFmpeg({
   manual = true,
   disconnectClients = true
@@ -895,7 +909,6 @@ function stopFFmpeg({
   const old = ffmpeg;
   ffmpeg = null;
 
-  // Xóa dữ liệu cũ nhưng không ngắt client khi đổi kênh
   clearAudioBuffer();
   clearVideoBuffer();
 
@@ -928,7 +941,6 @@ function startFFmpeg(channel) {
     return;
   }
 
-  // Dừng tiến trình cũ nhưng GIỮ client ESP32
   stopFFmpeg({
     manual: false,
     disconnectClients: false
@@ -968,7 +980,7 @@ function startFFmpeg(channel) {
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
   console.log("AUDIO MAX BUFFER:", AUDIO_BUFFER_MS, "ms");
-  console.log("MODE: LOW LATENCY INPUT + ADAPTIVE PCM");
+  console.log("MODE: PACED PCM + KEEPALIVE VIDEO");
   console.log("==================================");
 
   const videoFilter = [
@@ -982,9 +994,8 @@ function startFFmpeg(channel) {
     "-loglevel", "warning",
     "-nostdin",
 
-    // Tối ưu khởi tạo và phân tích luồng — nhanh hơn
-    "-probesize", "500000",
-    "-analyzeduration", "500000",
+    "-probesize", "1000000",
+    "-analyzeduration", "1000000",
 
     "-rw_timeout", "30000000",
     "-reconnect", "1",
@@ -992,15 +1003,14 @@ function startFFmpeg(channel) {
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
 
-    "-fflags", "+discardcorrupt+genpts+nobuffer",
-    "-flags", "low_delay",
-    "-max_delay", "500000",
+    // Bỏ +nobuffer: cho phép demuxer đệm một chút để làm mượt jitter
+    "-fflags", "+discardcorrupt+genpts",
 
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
 
-    // Giảm blocking khi pipe audio bị backpressure
-    "-thread_queue_size", "512",
+    // Buffer queue input rộng hơn → giảm blocking khi có burst
+    "-thread_queue_size", "1024",
     "-i", channel.url,
 
     // OUTPUT 1: MJPEG VIDEO
@@ -1016,11 +1026,11 @@ function startFFmpeg(channel) {
     "-f", "image2pipe",
     "pipe:1",
 
-    // OUTPUT 2: PCM AUDIO
+    // OUTPUT 2: PCM AUDIO — dùng cấu hình gốc (async=1000, min_hard_comp=0.1)
     "-map", "0:a:0?",
     "-vn",
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.05:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.1:first_pts=0`,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
@@ -1072,7 +1082,6 @@ function startFFmpeg(channel) {
   child.on("close", (code, signal) => {
     console.log("[FFmpeg] Exited:", code, signal);
 
-    // FFmpeg cũ không được phép ảnh hưởng phiên mới
     if (currentGeneration !== generation) return;
 
     if (ffmpeg === child) {
@@ -1121,7 +1130,6 @@ function scheduleRestart() {
 
   clearWatchdog();
 
-  // Tăng generation để loại bỏ dữ liệu từ tiến trình đang lỗi
   generation++;
 
   const old = ffmpeg;
@@ -1133,7 +1141,6 @@ function scheduleRestart() {
   audioBlocked = false;
   audioBlockedSince = 0;
 
-  // Giữ nguyên client khi FFmpeg tự phục hồi
   if (old) {
     try {
       old.kill("SIGKILL");
@@ -1156,7 +1163,7 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM - HỖ TRỢ ?fps=xxx
+// VIDEO STREAM
 // =====================================================
 
 app.get("/stream", (req, res) => {
@@ -1244,7 +1251,6 @@ app.get("/stream", (req, res) => {
 // =====================================================
 
 app.get("/audio", (req, res) => {
-  // Vẫn duy trì một audio client như thiết kế ban đầu
   disconnectAudioClient();
   resetAudioState(false);
 
@@ -1855,6 +1861,9 @@ async function main() {
     );
   }
 
+  // Chạy nền: resend frame cuối nếu FFmpeg tạm ngưng sản xuất
+  startVideoKeepalive();
+
   app.listen(PORT, "0.0.0.0", () => {
     console.log("--------------------------------");
     console.log("IPTV SERVER RUNNING");
@@ -1911,7 +1920,6 @@ async function main() {
     console.log("--------------------------------");
   });
 
-  // Tự thử tải playlist lại nếu lần đầu thất bại
   if (!channels.length) {
     const retryPlaylist = async () => {
       try {
