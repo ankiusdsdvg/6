@@ -27,7 +27,6 @@ const JPEG_QUALITY_720P = 15;
 const JPEG_QUALITY_540P = 20;
 const JPEG_QUALITY_340P = 25;
 
-// Broadcast video đúng nhịp VIDEO_FPS — không phụ thuộc burst từ FFmpeg
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const QUALITY_PRESETS = Object.freeze([
@@ -61,11 +60,7 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Prebuffer khởi động — 1000ms.
-// Kết hợp với -re, buffer sẽ đầy đều đặn trong ~1s.
 const AUDIO_START_BUFFER_MS = 1000;
-
-// Buffer tối đa — 3500ms, đủ rộng cho jitter nhỏ.
 const AUDIO_BUFFER_MS = 3500;
 
 const AUDIO_BUFFER_MAX =
@@ -96,16 +91,19 @@ const MAX_CLIENT_BLOCK_MS = 3000;
 const MAX_AUDIO_BLOCK_MS = 1500;
 
 // =====================================================
-// VIDEO QUEUE / PRIMING
+// VIDEO QUEUE / PRIMING / SYNC
 // =====================================================
-// Hàng đợi frame video — broadcast đúng 12fps từ đây.
-// Nhờ vậy burst từ FFmpeg bị "san phẳng" thành 12fps đều.
 
-const VIDEO_QUEUE_TARGET = 12;   // ~1s buffer trước khi phát
-const VIDEO_QUEUE_MAX = 36;      // ~3s tối đa, tránh latency tích tụ
+const VIDEO_QUEUE_TARGET = 12;   // ~1s buffer
+const VIDEO_QUEUE_MAX = 36;      // ~3s tối đa
+
+// Drift tối đa giữa audio và video (ms). Vượt ngưỡng → re-prime.
+const MAX_SYNC_DRIFT_MS = 800;
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
+
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
 
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_JolAxI55rXAodSTE5PaNlpGAq5A0";
 
@@ -116,6 +114,7 @@ const RENDER_SERVICE_IDS = (
 const BANDWIDTH_LIMIT_GB = Number(
   process.env.BANDWIDTH_LIMIT_GB || 5
 );
+
 
 // =====================================================
 // GLOBAL STATE
@@ -133,6 +132,7 @@ let jpegPending = Buffer.alloc(0);
 let videoQueue = [];
 let videoPrimed = false;
 let videoBroadcastTimer = null;
+let videoNextTickTime = 0;
 
 let videoDroppedFrames = 0;
 let videoInvalidFrames = 0;
@@ -158,12 +158,16 @@ let audioMaxObservedBytes = 0;
 
 let audioNextTickTime = 0;
 
+// Sync state — cả audio và video tính nhịp từ cùng mốc này
+let syncEpoch = 0;
+let audioFramesSinceSync = 0;
+let videoFramesSinceSync = 0;
+let lastDriftCheck = 0;
+
 let watchdogTimer = null;
 let restartTimer = null;
 
-// Thời điểm nhận frame cuối từ FFmpeg (dùng cho watchdog)
 let lastVideoFrameReceived = 0;
-// Thời điểm broadcast frame cuối ra client (dùng cho client state)
 let lastVideoFrameTime = 0;
 
 let restarting = false;
@@ -339,6 +343,55 @@ async function loadChannels() {
   }
 
   throw lastError || new Error("No playlist available");
+}
+
+// =====================================================
+// SYNC / DRIFT
+// =====================================================
+
+function resetSync() {
+  syncEpoch = 0;
+  audioFramesSinceSync = 0;
+  videoFramesSinceSync = 0;
+  lastDriftCheck = 0;
+}
+
+function rePrimeAll(reason) {
+  console.log("[SYNC] Re-priming:", reason);
+
+  clearAudioBuffer();
+  videoQueue = [];
+
+  audioPrimed = false;
+  videoPrimed = false;
+
+  audioNextTickTime = 0;
+  videoNextTickTime = 0;
+
+  resetSync();
+}
+
+function checkDrift() {
+  if (!audioPrimed || !videoPrimed || syncEpoch === 0) {
+    return;
+  }
+
+  const now = Date.now();
+
+  if (now - lastDriftCheck < 2000) return;
+  lastDriftCheck = now;
+
+  const audioMs = audioFramesSinceSync * AUDIO_FRAME_MS;
+  const videoMs = videoFramesSinceSync * VIDEO_INTERVAL;
+
+  const drift = audioMs - videoMs;
+
+  if (Math.abs(drift) > MAX_SYNC_DRIFT_MS) {
+    rePrimeAll(
+      `drift ${drift > 0 ? "+" : ""}${Math.round(drift)}ms ` +
+      `(audio ${Math.round(audioMs)}ms / video ${Math.round(videoMs)}ms)`
+    );
+  }
 }
 
 // =====================================================
@@ -585,11 +638,35 @@ function audioTick() {
       audioTargetBufferMs,
       "ms"
     );
+
+    // Chưa phát — chờ video primed để sync chung mốc
+    return;
   }
+
+  // Chưa có video primed → chưa phát để tránh lệch từ đầu
+  if (!videoPrimed) return;
+
+  // Cả hai đã primed → đặt mốc sync nếu chưa có
+  if (syncEpoch === 0) {
+    syncEpoch = Date.now();
+    audioNextTickTime = syncEpoch + AUDIO_INTERVAL;
+    audioFramesSinceSync = 0;
+    videoFramesSinceSync = 0;
+    lastDriftCheck = syncEpoch;
+
+    console.log("[SYNC] Both primed — starting playback");
+    return;
+  }
+
+  checkDrift();
+
+  if (!audioPrimed || !videoPrimed || syncEpoch === 0) return;
 
   const frame = takeAudioFrame();
 
   writeAudioFrame(frame, false);
+
+  audioFramesSinceSync++;
 }
 
 function scheduleAudioTick() {
@@ -613,13 +690,14 @@ function scheduleAudioTick() {
   audioTimer = setTimeout(() => {
     audioNextTickTime += AUDIO_INTERVAL;
 
-    if (Date.now() - audioNextTickTime > AUDIO_INTERVAL) {
+    // Trễ quá 2 interval → resync (tránh burst catch-up)
+    if (Date.now() - audioNextTickTime > AUDIO_INTERVAL * 2) {
       audioNextTickTime = Date.now() + AUDIO_INTERVAL;
     }
 
     audioTick();
     scheduleAudioTick();
-  }, wait);
+  }, Math.round(wait));
 }
 
 function startAudioTimer() {
@@ -644,8 +722,6 @@ function clearVideoBuffer() {
   videoPrimed = false;
 }
 
-// Chạy mỗi VIDEO_INTERVAL (83ms) — lấy frame từ queue và phát.
-// Không phát khi queue chưa đủ dày (priming) → "khi đã ổn định mới phát".
 function videoBroadcastTick() {
   if (!videoQueue.length) return;
 
@@ -653,12 +729,31 @@ function videoBroadcastTick() {
     if (videoQueue.length >= VIDEO_QUEUE_TARGET) {
       videoPrimed = true;
       console.log(
-        "[VIDEO] Primed with", videoQueue.length, "frames → start broadcast"
+        "[VIDEO] Primed with", videoQueue.length, "frames"
       );
     } else {
       return;
     }
   }
+
+  if (!audioPrimed) return;
+
+  if (syncEpoch === 0) {
+    syncEpoch = Date.now();
+    videoNextTickTime = syncEpoch + VIDEO_INTERVAL;
+    audioFramesSinceSync = 0;
+    videoFramesSinceSync = 0;
+    lastDriftCheck = syncEpoch;
+
+    console.log("[SYNC] Both primed — starting playback (from video)");
+    return;
+  }
+
+  checkDrift();
+
+  if (!audioPrimed || !videoPrimed || syncEpoch === 0) return;
+
+  if (!videoQueue.length) return;
 
   const frame = videoQueue.shift();
 
@@ -669,16 +764,39 @@ function videoBroadcastTick() {
   lastVideoFrameTime = Date.now();
 
   broadcastFrame(frame);
+
+  videoFramesSinceSync++;
+}
+
+function scheduleVideoTick() {
+  const now = Date.now();
+
+  if (videoNextTickTime === 0) {
+    videoNextTickTime = now + VIDEO_INTERVAL;
+  }
+
+  const wait = Math.max(0, videoNextTickTime - now);
+
+  videoBroadcastTimer = setTimeout(() => {
+    videoNextTickTime += VIDEO_INTERVAL;
+
+    if (Date.now() - videoNextTickTime > VIDEO_INTERVAL * 2) {
+      videoNextTickTime = Date.now() + VIDEO_INTERVAL;
+    }
+
+    videoBroadcastTick();
+    scheduleVideoTick();
+  }, Math.round(wait));
 }
 
 function startVideoBroadcastTimer() {
   if (videoBroadcastTimer) {
-    clearInterval(videoBroadcastTimer);
+    clearTimeout(videoBroadcastTimer);
+    videoBroadcastTimer = null;
   }
-  videoBroadcastTimer = setInterval(
-    videoBroadcastTick,
-    VIDEO_INTERVAL
-  );
+
+  videoNextTickTime = 0;
+  scheduleVideoTick();
 }
 
 function broadcastFrame(frame) {
@@ -788,8 +906,6 @@ function cleanupVideoClient(res) {
   videoClients = Math.max(0, videoClients - 1);
 }
 
-// Parse JPEG từ pipe, đẩy vào queue. KHÔNG broadcast tại đây —
-// broadcast do videoBroadcastTick đảm nhiệm với nhịp cố định.
 function processVideoData(chunk, currentGeneration) {
   if (
     currentGeneration !== generation ||
@@ -924,6 +1040,7 @@ function stopFFmpeg({
 
   clearAudioBuffer();
   clearVideoBuffer();
+  resetSync();
 
   audioBlocked = false;
   audioBlockedSince = 0;
@@ -964,6 +1081,7 @@ function startFFmpeg(channel) {
 
   clearVideoBuffer();
   resetAudioState(true);
+  resetSync();
 
   videoDroppedFrames = 0;
   videoInvalidFrames = 0;
@@ -988,15 +1106,11 @@ function startFFmpeg(channel) {
     "JPEG q:",
     qualityPreset.jpegQuality
   );
-  console.log("DEFAULT CLIENT FPS:", DEFAULT_CLIENT_FPS);
-  console.log("SKIP THRESHOLD:", CLIENT_SKIP_THRESHOLD_MS, "ms");
-  console.log("MAX BLOCK:", MAX_CLIENT_BLOCK_MS, "ms");
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
-  console.log("AUDIO MAX BUFFER:", AUDIO_BUFFER_MS, "ms");
   console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
-  console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
-  console.log("MODE: -re REAL-TIME READ + PACED BROADCAST");
+  console.log("MAX SYNC DRIFT:", MAX_SYNC_DRIFT_MS, "ms");
+  console.log("MODE: -re + SYNC EPOCH + DRIFT MONITOR");
   console.log("==================================");
 
   const videoFilter = [
@@ -1019,8 +1133,6 @@ function startFFmpeg(channel) {
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
 
-    // Đọc input đúng 1x — KHÔNG đọc ồ ạt burst.
-    // Đây là fix chính cho việc audio/video bị glitch 10-15s.
     "-re",
 
     "-fflags", "+discardcorrupt+genpts",
@@ -1043,10 +1155,12 @@ function startFFmpeg(channel) {
     "pipe:1",
 
     // OUTPUT 2: PCM AUDIO
+    // async=100 (thay vì 1000) — giảm 10x tốc độ compensate drift
+    // min_hard_comp=0.500 — chỉ drop khi lệch > 500ms
     "-map", "0:a:0?",
     "-vn",
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.100:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=100:min_hard_comp=0.500:first_pts=0`,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
@@ -1106,6 +1220,7 @@ function startFFmpeg(channel) {
 
     clearAudioBuffer();
     clearVideoBuffer();
+    resetSync();
 
     if (!manuallyStopped) {
       scheduleRestart();
@@ -1153,6 +1268,7 @@ function scheduleRestart() {
 
   clearAudioBuffer();
   clearVideoBuffer();
+  resetSync();
 
   audioBlocked = false;
   audioBlockedSince = 0;
@@ -1233,8 +1349,6 @@ app.get("/stream", (req, res) => {
 
   videoClientsMap.set(res, state);
 
-  // Chỉ gửi frame khởi động nếu video đã primed.
-  // Nếu chưa, client sẽ nhận frame đầu tiên khi broadcast tick tiếp theo sau prime.
   if (
     videoPrimed &&
     latestFrame &&
@@ -1291,9 +1405,7 @@ app.get("/audio", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  console.log(
-    "[AUDIO] Client connected; silence until primed"
-  );
+  console.log("[AUDIO] Client connected; silence until primed");
 
   startAudioTimer();
 
@@ -1752,6 +1864,9 @@ app.get("/health", (req, res) => {
     });
   }
 
+  const audioMs = audioFramesSinceSync * AUDIO_FRAME_MS;
+  const videoMs = videoFramesSinceSync * VIDEO_INTERVAL;
+
   res.json({
     status: "running",
 
@@ -1764,7 +1879,7 @@ app.get("/health", (req, res) => {
     restarting,
     manuallyStopped,
 
-    pipeline: "REALTIME_READ_MJPEG_PCM_PACED",
+    pipeline: "REALTIME_READ + SYNC_EPOCH + DRIFT_MONITOR",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1799,6 +1914,16 @@ app.get("/health", (req, res) => {
       : null,
 
     clientDetails,
+
+    sync: {
+      epoch: syncEpoch,
+      audioFramesSinceSync,
+      videoFramesSinceSync,
+      audioMs: Math.round(audioMs),
+      videoMs: Math.round(videoMs),
+      driftMs: Math.round(audioMs - videoMs),
+      maxDriftMs: MAX_SYNC_DRIFT_MS
+    },
 
     audioSampleRate: AUDIO_SAMPLE_RATE,
     audioChannels: AUDIO_CHANNELS,
@@ -1862,19 +1987,14 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - REAL-TIME READ + PACED BROADCAST\n" +
+    "IPTV SERVER RUNNING - SYNCED MJPEG + PCM\n" +
     "Usage:\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
     "  /stream?fps=6        → 6 fps\n" +
     "  /audio               → PCM audio\n" +
-    "\nPlayback starts only after:\n" +
-    "  - Audio buffer >= " + AUDIO_START_BUFFER_MS + "ms\n" +
-    "  - Video queue >= " + VIDEO_QUEUE_TARGET + " frames\n" +
-    "\nAuto-recover:\n" +
-    "  - Client block < " + CLIENT_SKIP_THRESHOLD_MS + "ms → send tiếp\n" +
-    "  - Client block > " + CLIENT_SKIP_THRESHOLD_MS + "ms → bỏ frame\n" +
-    "  - Client block > " + MAX_CLIENT_BLOCK_MS + "ms → ngắt client"
+    "\nPlayback starts after both primed, on a shared epoch.\n" +
+    "Drift monitor re-primes if |audio-video| > " + MAX_SYNC_DRIFT_MS + "ms."
   );
 });
 
@@ -1893,7 +2013,6 @@ async function main() {
     );
   }
 
-  // Video broadcast pacing — chạy suốt vòng đời server
   startVideoBroadcastTimer();
 
   app.listen(PORT, "0.0.0.0", () => {
@@ -1901,39 +2020,14 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-
     console.log(
-      "VIDEO (max):",
+      "VIDEO:",
       `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`
     );
-
-    console.log(
-      "DEFAULT CLIENT FPS:",
-      DEFAULT_CLIENT_FPS
-    );
-
-    console.log(
-      "VIDEO QUEUE TARGET:",
-      VIDEO_QUEUE_TARGET,
-      "frames"
-    );
-
-    console.log(
-      "AUDIO START BUFFER:",
-      AUDIO_START_BUFFER_MS,
-      "ms"
-    );
-
-    console.log(
-      "AUDIO MAX BUFFER:",
-      AUDIO_BUFFER_MS,
-      "ms"
-    );
-
-    console.log(
-      "PIPELINE: -re + PACED BROADCAST"
-    );
-
+    console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
+    console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
+    console.log("MAX SYNC DRIFT:", MAX_SYNC_DRIFT_MS, "ms");
+    console.log("PIPELINE: -re + SYNC EPOCH + DRIFT MONITOR");
     console.log("--------------------------------");
   });
 
@@ -1941,18 +2035,10 @@ async function main() {
     const retryPlaylist = async () => {
       try {
         await loadChannels();
-
-        console.log(
-          "[M3U] Playlist recovered:",
-          channels.length
-        );
+        console.log("[M3U] Playlist recovered:", channels.length);
 
       } catch (error) {
-        console.log(
-          "[M3U] Retry failed:",
-          error.message
-        );
-
+        console.log("[M3U] Retry failed:", error.message);
         setTimeout(retryPlaylist, 15000);
       }
     };
