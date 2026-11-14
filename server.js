@@ -1,5 +1,3 @@
-
-
 const express = require("express");
 const { spawn } = require("child_process");
 
@@ -56,12 +54,16 @@ const AUDIO_FRAME_BYTES =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_FRAME_MS / 1000;
 
-// Buffer khởi động nhanh hơn
-const AUDIO_START_BUFFER_MS = 500;
+const AUDIO_BYTES_PER_MS =
+  AUDIO_SAMPLE_RATE *
+  AUDIO_CHANNELS *
+  AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Buffer tối đa 2000ms.
-// Bản cũ chỉ có 800ms nhưng target có thể lên 1400ms.
-const AUDIO_BUFFER_MS = 2000;
+// Prebuffer lớn hơn — hấp thụ burst ban đầu của FFmpeg
+const AUDIO_START_BUFFER_MS = 1500;
+
+// Buffer tối đa lớn hơn để chịu burst + catch-up
+const AUDIO_BUFFER_MS = 3000;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -72,11 +74,17 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 500;
-const AUDIO_TARGET_MAX_MS = 1400;
+const AUDIO_TARGET_MIN_MS = 800;
+const AUDIO_TARGET_MAX_MS = 2000;
 
-// Giảm target sau khoảng 10 giây phát ổn định
-const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
+// Hạ target nhanh hơn sau khi ổn định (~5s thay vì 10s)
+const AUDIO_STABLE_FRAMES_TO_REDUCE = 25;
+
+// Adaptive consumption — giảm tốc độ "ăn" khi buffer thấp
+const AUDIO_LOW_BUFFER_MS = 500;
+const AUDIO_LOW_FACTOR = 0.75;   // 150ms/200ms
+const AUDIO_MID_BUFFER_MS = 1000;
+const AUDIO_MID_FACTOR = 0.9;    // 180ms/200ms
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
@@ -141,8 +149,10 @@ let audioFramesSent = 0;
 let audioSilenceSent = 0;
 let audioPrimed = false;
 let audioSilenceBytes = 0;
-let audioLastTick = 0;
 let audioMaxObservedBytes = 0;
+
+// Timer tuyệt đối — chống drift
+let audioNextTickTime = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -332,7 +342,7 @@ function resetAudioState(resetStats = false) {
   audioPrimed = false;
   audioStableFrames = 0;
   audioTargetBufferMs = AUDIO_START_BUFFER_MS;
-  audioLastTick = 0;
+  audioNextTickTime = 0;
   audioMaxObservedBytes = 0;
 
   if (resetStats) {
@@ -442,30 +452,39 @@ function makeSilenceFrame() {
 }
 
 function takeAudioFrame() {
-  const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
+  const bufferMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
 
-  const count = Math.min(
-    audioBuffer.length,
-    AUDIO_FRAME_BYTES
-  ) & ~1;
+  // Khi buffer thấp → "ăn" ít hơn để buffer kịp hồi
+  let consumeBytes = AUDIO_FRAME_BYTES;
 
-  if (count > 0) {
-    audioBuffer.copy(frame, 0, 0, count);
-    audioBuffer = audioBuffer.subarray(count);
+  if (bufferMs < AUDIO_LOW_BUFFER_MS) {
+    consumeBytes = Math.floor(AUDIO_FRAME_BYTES * AUDIO_LOW_FACTOR) & ~1;
+  } else if (bufferMs < AUDIO_MID_BUFFER_MS) {
+    consumeBytes = Math.floor(AUDIO_FRAME_BYTES * AUDIO_MID_FACTOR) & ~1;
   }
 
-  if (count < AUDIO_FRAME_BYTES) {
-    audioUnderflows++;
+  const available = Math.min(audioBuffer.length, consumeBytes) & ~1;
 
-    audioSilenceBytes +=
-      AUDIO_FRAME_BYTES - count;
+  const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
 
-    audioStableFrames = 0;
+  if (available > 0) {
+    audioBuffer.copy(frame, 0, 0, available);
+    audioBuffer = audioBuffer.subarray(available);
+  }
 
-    audioTargetBufferMs = Math.min(
-      AUDIO_TARGET_MAX_MS,
-      audioTargetBufferMs + 100
-    );
+  if (available < AUDIO_FRAME_BYTES) {
+    audioSilenceBytes += AUDIO_FRAME_BYTES - available;
+
+    // Chỉ tăng target khi thực sự thiếu so với mức tiêu thụ
+    if (available < consumeBytes) {
+      audioUnderflows++;
+      audioStableFrames = 0;
+
+      audioTargetBufferMs = Math.min(
+        AUDIO_TARGET_MAX_MS,
+        audioTargetBufferMs + 100
+      );
+    }
 
   } else {
     audioStableFrames++;
@@ -548,16 +567,9 @@ function audioTick() {
     return;
   }
 
-  // Không gửi dồn nhiều frame nếu timer bị trễ.
-  // Mỗi lần tick chỉ gửi đúng một frame PCM.
-  audioLastTick = Date.now();
-
   if (!audioPrimed) {
     const targetBytes = Math.floor(
-      AUDIO_SAMPLE_RATE *
-      AUDIO_CHANNELS *
-      AUDIO_BYTES_PER_SAMPLE *
-      audioTargetBufferMs / 1000
+      AUDIO_BYTES_PER_MS * audioTargetBufferMs
     );
 
     if (audioBuffer.length < targetBytes) {
@@ -592,11 +604,21 @@ function scheduleAudioTick() {
   }
 
   const now = Date.now();
-  const base = audioLastTick || now;
-  const next = base + AUDIO_INTERVAL;
-  const wait = Math.max(0, next - now);
+
+  if (audioNextTickTime === 0) {
+    audioNextTickTime = now + AUDIO_INTERVAL;
+  }
+
+  const wait = Math.max(0, audioNextTickTime - now);
 
   audioTimer = setTimeout(() => {
+    audioNextTickTime += AUDIO_INTERVAL;
+
+    // Nếu bị trễ quá 1 frame (event loop bận) → resync
+    if (Date.now() - audioNextTickTime > AUDIO_INTERVAL) {
+      audioNextTickTime = Date.now() + AUDIO_INTERVAL;
+    }
+
     audioTick();
     scheduleAudioTick();
   }, wait);
@@ -608,7 +630,7 @@ function startAudioTimer() {
     audioTimer = null;
   }
 
-  audioLastTick = Date.now();
+  audioNextTickTime = 0;
   scheduleAudioTick();
 }
 
@@ -960,9 +982,9 @@ function startFFmpeg(channel) {
     "-loglevel", "warning",
     "-nostdin",
 
-    // Tối ưu khởi tạo và phân tích luồng
-    "-probesize", "1000000",
-    "-analyzeduration", "1000000",
+    // Tối ưu khởi tạo và phân tích luồng — nhanh hơn
+    "-probesize", "500000",
+    "-analyzeduration", "500000",
 
     "-rw_timeout", "30000000",
     "-reconnect", "1",
@@ -977,8 +999,8 @@ function startFFmpeg(channel) {
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
 
-    // Bỏ -re để tránh giới hạn tốc độ đọc đầu vào.
-    // Nguồn live tự quyết định tốc độ dữ liệu.
+    // Giảm blocking khi pipe audio bị backpressure
+    "-thread_queue_size", "512",
     "-i", channel.url,
 
     // OUTPUT 1: MJPEG VIDEO
@@ -998,7 +1020,7 @@ function startFFmpeg(channel) {
     "-map", "0:a:0?",
     "-vn",
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.100:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:min_hard_comp=0.05:first_pts=0`,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
