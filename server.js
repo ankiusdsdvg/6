@@ -103,7 +103,6 @@ const MAX_SYNC_DRIFT_MS = 800;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
 
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_JolAxI55rXAodSTE5PaNlpGAq5A0";
 
