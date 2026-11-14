@@ -36,7 +36,7 @@ const QUALITY_PRESETS = Object.freeze([
 ]);
 
 // 1080p/q10 giữ nguyên chất lượng mặc định trước đây.
-let currentQualityId = "1080p";
+let currentQualityId = "720p";
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
