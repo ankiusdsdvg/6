@@ -12,8 +12,8 @@ app.use(express.json({ limit: "32kb" }));
 // =====================================================
 
 const M3U_URLS = [
-  "https://raw.githubusercontent.com/ankiusdsdvg/6/main/relaybongden.m3u",
-  "https://iptv-org.github.io/iptv/countries/vn.m3u"
+  "https://raw.githubusercontent.com/ankiusdsdvg/6/main/relaybongden.m3u"
+  
 ];
 
 const VIDEO_WIDTH = 320;
