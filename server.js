@@ -11,10 +11,11 @@ app.use(express.json({ limit: "32kb" }));
 // CONFIG
 // =====================================================
 
+
 const M3U_URLS = [
   "https://raw.githubusercontent.com/ankiusdsdvg/6/main/relaybongden.m3u"
-  
 ];
+
 
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 240;
