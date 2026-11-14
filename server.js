@@ -107,10 +107,10 @@ const VIDEO_QUEUE_MAX = 36;      // ~3s tối đa, tránh latency tích tụ
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_JolAxI55rXAodSTE5PaNlpGAq5A0";
 
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
+  process.env.RENDER_SERVICE_IDS || "srv-dbs5vb8n74is738ut5e0"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
 const BANDWIDTH_LIMIT_GB = Number(
