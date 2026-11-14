@@ -41,14 +41,16 @@ let currentQualityId = "1080p";
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
-const AUDIO_FRAME_MS = 200;
+// Gói nhỏ hơn giúp client có nhịp dữ liệu đều, tránh mỗi lần timer chạy lại
+// dồn một burst PCM lớn làm video/decoder bị đói CPU.
+const AUDIO_FRAME_MS = 80;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 800;
-const AUDIO_BUFFER_MS = 800;
+const AUDIO_START_BUFFER_MS = 700;
+const AUDIO_BUFFER_MS = 1000;
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE * AUDIO_BUFFER_MS / 1000;
@@ -57,7 +59,7 @@ let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
 const AUDIO_TARGET_MIN_MS = 700;
-const AUDIO_TARGET_MAX_MS = 1400;
+const AUDIO_TARGET_MAX_MS = 1000;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
 
 const DECODER_THREADS = 2;
@@ -71,7 +73,7 @@ const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 
 // 🔥 TỰ PHỤC HỒI CLIENT
-const CLIENT_SKIP_THRESHOLD_MS = 30;   // block > 300ms → bỏ frame
+const CLIENT_SKIP_THRESHOLD_MS = 80;   // block ngắn vẫn tự phục hồi, không tạo burst
 const MAX_CLIENT_BLOCK_MS = 3000;       // block > 3s → ngắt client
 
 const MAX_AUDIO_BLOCK_MS = 1500;
@@ -79,9 +81,9 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_52xtlcbg2i87jY2mMExK7PcQ9LHG";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_E4m8zGWRFKuhlc7kAuvU8IPoTZd5";
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbrku88n74is7395hpa0"
+  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
 const BANDWIDTH_LIMIT_GB = Number(process.env.BANDWIDTH_LIMIT_GB || 5);
@@ -457,7 +459,10 @@ function audioTick() {
     console.warn("[AUDIO] Sender clock delayed:", elapsed, "ms");
   }
 
-  const framesToSend = Math.max(1, Math.round(elapsed / AUDIO_INTERVAL));
+  // Không gửi bù hàng loạt sau một lần event-loop bị trễ. Burst PCM làm
+  // client phải xử lý dồn và thường kéo theo giật hình; phần thiếu sẽ được
+  // bù bằng prebuffer/nhịp kế tiếp.
+  const framesToSend = Math.min(2, Math.max(1, Math.round(elapsed / AUDIO_INTERVAL)));
 
   for (let i = 0; i < framesToSend; i++) {
     if (!audioPrimed) {
@@ -555,7 +560,7 @@ function broadcastFrame(frame) {
         continue;
       }
 
-      // Block > 300ms → BỎ FRAME này (tự phục hồi)
+    // Client chậm: bỏ frame cũ thay vì chặn pipeline FFmpeg.
       if (blockDuration > CLIENT_SKIP_THRESHOLD_MS) {
         state.skippedFrames++;
         continue;
@@ -566,23 +571,25 @@ function broadcastFrame(frame) {
 
     if (state.lastSentSequence === frameSequence) continue;
 
-    // Per-client throttle
-    if (state.clientInterval > 0) {
-      const timeSinceLastSend = now - state.lastSentTime;
-
-      if (timeSinceLastSend < state.clientInterval * 0.9) {
-        state.skippedFrames++;
-        continue;
-      }
+    // Phát theo deadline cố định. Cách so sánh với 90% interval cũ tạo jitter
+    // và có thể phát hai frame sát nhau sau một lần loop bị trễ.
+    if (state.nextSendAt > now) {
+      state.skippedFrames++;
+      continue;
     }
 
     try {
+      res.cork();
       let ok = res.write(header);
       if (!res.write(frame)) ok = false;
       if (!res.write(trailer)) ok = false;
+      res.uncork();
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
+      state.nextSendAt = state.clientInterval > 0
+        ? Math.max(now, state.nextSendAt) + state.clientInterval
+        : now;
       videoSentFrames++;
 
       if (!ok) {
@@ -595,6 +602,9 @@ function broadcastFrame(frame) {
         res.once("drain", () => {
           state.blocked = false;
           state.blockedSince = 0;
+          // Không phát bù một loạt frame sau khi socket thông; lấy frame mới
+          // nhất ở nhịp kế tiếp để giữ độ trễ thấp.
+          state.nextSendAt = Date.now();
         });
       }
 
@@ -912,6 +922,28 @@ function scheduleRestart() {
 // =====================================================
 
 app.get("/stream", (req, res) => {
+  // Selecting through the stream request removes one extra TLS round trip on
+  // small clients. The old /api/select endpoint remains available for older
+  // clients, while new clients can request the channel and MJPEG in one go.
+  const requestedChannel = req.query.channel === undefined
+    ? ""
+    : String(req.query.channel);
+  if (requestedChannel) {
+    const channel = channels.find(item =>
+      item.id === requestedChannel ||
+      item.name.toLowerCase() === requestedChannel.toLowerCase()
+    );
+    if (!channel) {
+      return res.status(404).json({
+        success: false,
+        error: "Channel not found"
+      });
+    }
+    if (currentChannel !== channel || manuallyStopped || !ffmpeg) {
+      startFFmpeg(channel);
+    }
+  }
+
   const requestedFps = Number(req.query.fps);
   let clientFps = DEFAULT_CLIENT_FPS;
 
@@ -922,9 +954,9 @@ app.get("/stream", (req, res) => {
     );
   }
 
-  const clientInterval = clientFps >= VIDEO_FPS
-    ? 0
-    : (1000 / clientFps);
+  // Luôn giữ deadline cho từng client, kể cả khi xin FPS tối đa. Nếu để 0,
+  // nhiều frame từ cùng một chunk stdout có thể được ghi liên tiếp thành burst.
+  const clientInterval = 1000 / Math.min(clientFps, VIDEO_FPS);
 
   console.log(
     "[VIDEO] Client connected - requested fps:",
@@ -951,6 +983,7 @@ app.get("/stream", (req, res) => {
     clientFps,
     clientInterval,
     lastSentTime: 0,
+    nextSendAt: 0,
     skippedFrames: 0,
     blockCount: 0
   };
@@ -976,6 +1009,7 @@ app.get("/stream", (req, res) => {
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = Date.now();
+      state.nextSendAt = Date.now() + (clientInterval > 0 ? clientInterval : 0);
       videoSentFrames++;
     } catch (_) {}
   }
