@@ -79,12 +79,15 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
 
-const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_E4m8zGWRFKuhlc7kAuvU8IPoTZd5";
+const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_JolAxI55rXAodSTE5PaNlpGAq5A0";
+
 const RENDER_SERVICE_IDS = (
-  process.env.RENDER_SERVICE_IDS || "srv-dbphu6vf3r2c738786ng"
+  process.env.RENDER_SERVICE_IDS || "srv-dbs5vb8n74is738ut5e0"
 ).split(",").map(x => x.trim()).filter(Boolean);
 
-const BANDWIDTH_LIMIT_GB = Number(process.env.BANDWIDTH_LIMIT_GB || 5);
+const BANDWIDTH_LIMIT_GB = Number(
+  process.env.BANDWIDTH_LIMIT_GB || 5
+);
 
 // =====================================================
 // GLOBAL STATE
