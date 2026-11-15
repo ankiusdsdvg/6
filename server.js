@@ -60,8 +60,11 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
+// Buffer khởi động — dùng để xác định audioPrimed
 const AUDIO_START_BUFFER_MS = 1000;
-const AUDIO_BUFFER_MS = 3500;
+
+// Buffer tối đa — khớp với VIDEO_QUEUE_MAX (2s) để A/V cân
+const AUDIO_BUFFER_MS = 2000;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -91,24 +94,23 @@ const MAX_CLIENT_BLOCK_MS = 3000;
 const MAX_AUDIO_BLOCK_MS = 1500;
 
 // =====================================================
-// MASTER TIMER / VIDEO QUEUE / SYNC
+// MASTER TIMER / VIDEO QUEUE / SYNC / STREAM READY
 // =====================================================
 
-// Master timer — gộp audio + video vào 1 nhịp duy nhất, tính từ wall clock
 const MASTER_TICK_MS = 10;
 
 const VIDEO_QUEUE_TARGET = 12;
-const VIDEO_QUEUE_MAX = 20;
+const VIDEO_QUEUE_MAX = 24;   // 2s — khớp AUDIO_BUFFER_MS
 
-// Nếu video queue "già" hơn audio buffer quá ngưỡng này → drop frame cũ
 const SYNC_TRIM_MS = 300;
-
-// Drift tối đa (chỉ dùng làm safety net, không nên trigger với epoch-based)
 const MAX_SYNC_DRIFT_MS = 800;
+
+// Streaming gate — chỉ mở khi đã "ổn định"
+const STREAM_READY_GRACE_MS = 500;    // chờ thêm 500ms sau syncEpoch
+const STREAM_READY_TIMEOUT_MS = 25000; // tối đa 25s cho client chờ
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
-
 const RENDER_API_KEY = process.env.RENDER_API_KEY || "rnd_JolAxI55rXAodSTE5PaNlpGAq5A0";
 
 const RENDER_SERVICE_IDS = (
@@ -118,7 +120,6 @@ const RENDER_SERVICE_IDS = (
 const BANDWIDTH_LIMIT_GB = Number(
   process.env.BANDWIDTH_LIMIT_GB || 5
 );
-
 
 // =====================================================
 // GLOBAL STATE
@@ -157,15 +158,17 @@ let audioPrimed = false;
 let audioSilenceBytes = 0;
 let audioMaxObservedBytes = 0;
 
-// Master timer + priming pacing cho audio
 let masterTimer = null;
-let lastAudioPrimeTick = 0;
 
-// Sync — cả audio và video tính frame count từ wall clock so với epoch
 let syncEpoch = 0;
 let audioFramesSinceSync = 0;
 let videoFramesSinceSync = 0;
 let lastDriftCheck = 0;
+
+// Streaming gate
+let streamReady = false;
+let streamReadyAt = 0;
+const streamReadyWaiters = [];
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -177,26 +180,78 @@ let restarting = false;
 let manuallyStopped = true;
 
 // =====================================================
+// STREAM READY — GATE
+// =====================================================
+
+function setStreamReady() {
+  if (streamReady) return;
+
+  streamReady = true;
+  streamReadyAt = Date.now();
+
+  console.log("[STREAM] READY — streaming enabled");
+
+  const waiters = streamReadyWaiters.splice(0);
+
+  for (const fn of waiters) {
+    try { fn(); } catch (_) {}
+  }
+}
+
+function resetStreamReady(reason = "") {
+  if (!streamReady) return;
+
+  streamReady = false;
+  streamReadyAt = 0;
+
+  if (reason) {
+    console.log("[STREAM] Reset:", reason);
+  }
+}
+
+function waitForStreamReady(timeoutMs) {
+  return new Promise(resolve => {
+    if (streamReady) return resolve(true);
+
+    let done = false;
+
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+
+      const idx = streamReadyWaiters.indexOf(wrap);
+      if (idx >= 0) streamReadyWaiters.splice(idx, 1);
+
+      resolve(false);
+    }, timeoutMs);
+
+    const wrap = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(true);
+    };
+
+    streamReadyWaiters.push(wrap);
+  });
+}
+
+// =====================================================
 // PLAYLIST
 // =====================================================
 
 function parseResolutionFromName(name) {
   const match = name.match(/\((\d{3,4})p\)|\b(\d{3,4})p\b/i);
-
-  return match
-    ? Number(match[1] || match[2]) || 0
-    : 0;
+  return match ? Number(match[1] || match[2]) || 0 : 0;
 }
 
 function parseM3U(content) {
   const lines = content.split(/\r?\n/);
   const result = [];
-
   let currentInfo = null;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-
     if (!line) continue;
 
     if (line.startsWith("#EXTINF:")) {
@@ -211,17 +266,10 @@ function parseM3U(content) {
       continue;
     }
 
-    const name =
-      currentInfo.split(",").pop().trim() || "Unknown channel";
-
-    const groupMatch =
-      currentInfo.match(/group-title="([^"]*)"/i);
-
-    const logoMatch =
-      currentInfo.match(/tvg-logo="([^"]*)"/i);
-
-    const idMatch =
-      currentInfo.match(/tvg-id="([^"]*)"/i);
+    const name = currentInfo.split(",").pop().trim() || "Unknown channel";
+    const groupMatch = currentInfo.match(/group-title="([^"]*)"/i);
+    const logoMatch = currentInfo.match(/tvg-logo="([^"]*)"/i);
+    const idMatch = currentInfo.match(/tvg-id="([^"]*)"/i);
 
     result.push({
       id: String(result.length),
@@ -241,42 +289,24 @@ function parseM3U(content) {
 
 function filterChannelsByResolution(list, maxResolution = 720) {
   if (!Array.isArray(list)) return [];
-
-  if (maxResolution === Number.MAX_SAFE_INTEGER) {
-    return list;
-  }
-
-  return list.filter(c =>
-    !c.resolution || c.resolution <= maxResolution
-  );
+  if (maxResolution === Number.MAX_SAFE_INTEGER) return list;
+  return list.filter(c => !c.resolution || c.resolution <= maxResolution);
 }
 
 function normalizeQualityId(value) {
-  const raw = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "");
-
+  const raw = String(value || "").trim().toLowerCase().replace(/\s+/g, "");
   if (!raw) return null;
-
-  const normalized = raw.endsWith("p")
-    ? raw
-    : `${raw}p`;
-
-  return QUALITY_PRESETS.some(
-    preset => preset.id === normalized
-  ) ? normalized : null;
+  const normalized = raw.endsWith("p") ? raw : `${raw}p`;
+  return QUALITY_PRESETS.some(preset => preset.id === normalized)
+    ? normalized : null;
 }
 
 function getCurrentQualityPreset() {
-  return QUALITY_PRESETS.find(
-    preset => preset.id === currentQualityId
-  ) || QUALITY_PRESETS[0];
+  return QUALITY_PRESETS.find(p => p.id === currentQualityId) || QUALITY_PRESETS[0];
 }
 
 function qualityResponse() {
   const preset = getCurrentQualityPreset();
-
   return {
     quality: preset.id,
     jpegQuality: preset.jpegQuality,
@@ -290,11 +320,9 @@ function qualityResponse() {
 
 function setQuality(value) {
   const qualityId = normalizeQualityId(value);
-
   if (!qualityId) return null;
 
   const changed = qualityId !== currentQualityId;
-
   currentQualityId = qualityId;
 
   if (changed && currentChannel && !manuallyStopped) {
@@ -306,39 +334,23 @@ function setQuality(value) {
 
 async function loadChannels() {
   console.log("[M3U] Loading playlist...");
-
   let lastError = null;
 
   for (const url of M3U_URLS) {
     try {
       const response = await fetch(url, {
-        headers: {
-          "User-Agent": "Mozilla/5.0"
-        },
+        headers: { "User-Agent": "Mozilla/5.0" },
         signal: AbortSignal.timeout(20000)
       });
 
-      if (!response.ok) {
-        throw new Error("HTTP " + response.status);
-      }
+      if (!response.ok) throw new Error("HTTP " + response.status);
 
       const loaded = parseM3U(await response.text());
-
-      if (!loaded.length) {
-        throw new Error("Playlist contains no channels");
-      }
+      if (!loaded.length) throw new Error("Playlist contains no channels");
 
       channels = loaded;
-
-      console.log(
-        "[M3U] Loaded:",
-        channels.length,
-        "from",
-        url
-      );
-
+      console.log("[M3U] Loaded:", channels.length, "from", url);
       return channels;
-
     } catch (error) {
       lastError = error;
       console.warn("[M3U] Failed:", error.message);
@@ -349,7 +361,7 @@ async function loadChannels() {
 }
 
 // =====================================================
-// SYNC / DRIFT
+// SYNC
 // =====================================================
 
 function resetSync() {
@@ -357,19 +369,16 @@ function resetSync() {
   audioFramesSinceSync = 0;
   videoFramesSinceSync = 0;
   lastDriftCheck = 0;
-  lastAudioPrimeTick = 0;
 }
 
 function rePrimeAll(reason) {
   console.log("[SYNC] Re-priming:", reason);
-
   clearAudioBuffer();
   videoQueue = [];
-
   audioPrimed = false;
   videoPrimed = false;
-
   resetSync();
+  resetStreamReady("re-prime");
 }
 
 function checkDrift() {
@@ -398,7 +407,6 @@ function resetAudioState(resetStats = false) {
   audioStableFrames = 0;
   audioTargetBufferMs = AUDIO_START_BUFFER_MS;
   audioMaxObservedBytes = 0;
-  lastAudioPrimeTick = 0;
 
   if (resetStats) {
     audioUnderflows = 0;
@@ -415,31 +423,26 @@ function clearAudioBuffer() {
   audioStableFrames = 0;
 }
 
-function disconnectAudioClient() {
+// clearBuffer = false: giữ buffer + primed state (dùng khi client reconnect
+// hoặc khi /audio accept sau streamReady)
+function disconnectAudioClient(clearBuffer = true) {
   const old = audioClient;
 
   audioClient = null;
   audioBlocked = false;
   audioBlockedSince = 0;
 
-  clearAudioBuffer();
+  if (clearBuffer) {
+    clearAudioBuffer();
+  }
 
   if (old && !old.destroyed) {
-    try {
-      old.destroy();
-    } catch (_) {}
+    try { old.destroy(); } catch (_) {}
   }
 }
 
 function pushAudioBuffer(chunk) {
-  if (
-    !audioClient ||
-    audioClient.destroyed ||
-    audioClient.writableEnded ||
-    !chunk?.length
-  ) {
-    return;
-  }
+  if (!chunk?.length) return;
 
   if (chunk.length & 1) {
     chunk = chunk.subarray(0, chunk.length - 1);
@@ -481,10 +484,6 @@ function pushAudioBuffer(chunk) {
   }
 }
 
-function makeSilenceFrame() {
-  return Buffer.alloc(AUDIO_FRAME_BYTES, 0);
-}
-
 function takeAudioFrame() {
   const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
 
@@ -520,7 +519,6 @@ function takeAudioFrame() {
 
 function writeAudioFrame(frame, isSilence = false) {
   if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
-    disconnectAudioClient();
     return false;
   }
 
@@ -548,7 +546,7 @@ function writeAudioFrame(frame, isSilence = false) {
     return true;
   } catch (error) {
     console.error("[AUDIO WRITE]", error.message);
-    disconnectAudioClient();
+    disconnectAudioClient(false);
     return false;
   }
 }
@@ -591,16 +589,10 @@ function broadcastFrame(frame) {
       if (blockDuration > MAX_CLIENT_BLOCK_MS) {
         console.log(
           "[VIDEO] Slow client disconnected after",
-          blockDuration,
-          "ms block (skipped:",
-          state.skippedFrames,
-          ")"
+          blockDuration, "ms block (skipped:", state.skippedFrames, ")"
         );
-
         cleanupVideoClient(res);
-
         try { res.destroy(); } catch (_) {}
-
         continue;
       }
 
@@ -610,13 +602,10 @@ function broadcastFrame(frame) {
       }
     }
 
-    if (state.lastSentSequence === frameSequence) {
-      continue;
-    }
+    if (state.lastSentSequence === frameSequence) continue;
 
     if (state.clientInterval > 0) {
       const timeSinceLastSend = now - state.lastSentTime;
-
       if (timeSinceLastSend < state.clientInterval * 0.9) {
         state.skippedFrames++;
         continue;
@@ -625,13 +614,11 @@ function broadcastFrame(frame) {
 
     try {
       let ok = res.write(header);
-
       if (!res.write(frame)) ok = false;
       if (!res.write(trailer)) ok = false;
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
-
       videoSentFrames++;
 
       if (!ok) {
@@ -640,7 +627,6 @@ function broadcastFrame(frame) {
           state.blockedSince = Date.now();
           state.blockCount++;
         }
-
         res.once("drain", () => {
           state.blocked = false;
           state.blockedSince = 0;
@@ -656,15 +642,12 @@ function broadcastFrame(frame) {
 
 function cleanupVideoClient(res) {
   if (!videoClientsMap.has(res)) return;
-
   videoClientsMap.delete(res);
   videoClients = Math.max(0, videoClients - 1);
 }
 
 function processVideoData(chunk, currentGeneration) {
-  if (currentGeneration !== generation || !chunk?.length) {
-    return;
-  }
+  if (currentGeneration !== generation || !chunk?.length) return;
 
   if (chunk.length > MAX_VIDEO_BUFFER) {
     chunk = chunk.subarray(chunk.length - MAX_VIDEO_BUFFER);
@@ -674,11 +657,9 @@ function processVideoData(chunk, currentGeneration) {
   if (jpegPending.length + chunk.length > MAX_VIDEO_BUFFER) {
     const combined = Buffer.concat([jpegPending, chunk]);
     const lastStart = combined.lastIndexOf(JPEG_SOI);
-
     jpegPending = lastStart >= 0
       ? Buffer.from(combined.subarray(lastStart))
       : Buffer.alloc(0);
-
     videoInvalidFrames++;
   } else {
     jpegPending = jpegPending.length
@@ -690,23 +671,18 @@ function processVideoData(chunk, currentGeneration) {
     const start = jpegPending.indexOf(JPEG_SOI);
 
     if (start < 0) {
-      jpegPending =
-        jpegPending[jpegPending.length - 1] === 0xff
-          ? Buffer.from([0xff])
-          : Buffer.alloc(0);
+      jpegPending = jpegPending[jpegPending.length - 1] === 0xff
+        ? Buffer.from([0xff]) : Buffer.alloc(0);
       return;
     }
 
-    if (start > 0) {
-      jpegPending = jpegPending.subarray(start);
-    }
+    if (start > 0) jpegPending = jpegPending.subarray(start);
 
     const end = jpegPending.indexOf(JPEG_EOI, 2);
 
     if (end < 0) {
       if (jpegPending.length > MAX_JPEG_FRAME_BYTES) {
         videoInvalidFrames++;
-
         const nextStart = jpegPending.indexOf(JPEG_SOI, 2);
         jpegPending = nextStart >= 0
           ? Buffer.from(jpegPending.subarray(nextStart))
@@ -727,11 +703,10 @@ function processVideoData(chunk, currentGeneration) {
 
     lastVideoFrameReceived = Date.now();
 
-    // Sync trim — nếu queue già hơn audio quá ngưỡng thì drop frame cũ
+    // Sync trim
     if (videoPrimed && audioPrimed) {
       const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
       const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
-
       if (videoBufMs > audioBufMs + SYNC_TRIM_MS) {
         videoQueue.shift();
         videoDroppedFrames++;
@@ -756,116 +731,118 @@ function processVideoData(chunk, currentGeneration) {
 function masterTick() {
   const now = Date.now();
 
-  // --- 1) Audio emission / priming ---
-  if (audioClient && !audioClient.destroyed && !audioClient.writableEnded) {
-    if (!audioPrimed) {
-      // Priming — gửi silence theo nhịp 200ms
-      if (
-        lastAudioPrimeTick === 0 ||
-        now - lastAudioPrimeTick >= AUDIO_INTERVAL
-      ) {
-        lastAudioPrimeTick = now;
-
-        const targetBytes = Math.floor(
-          AUDIO_BYTES_PER_MS * audioTargetBufferMs
-        );
-
-        if (audioBuffer.length < targetBytes) {
-          writeAudioFrame(makeSilenceFrame(), true);
-        } else {
-          audioPrimed = true;
-          console.log(
-            "[AUDIO] Primed:",
-            audioBuffer.length,
-            "bytes / target:",
-            audioTargetBufferMs,
-            "ms"
-          );
-        }
-      }
-    } else if (syncEpoch > 0 && !audioBlocked) {
-      // Primed + epoch set → emit chính xác theo wall clock
-      const expected = Math.floor((now - syncEpoch) / AUDIO_INTERVAL);
-      const gap = expected - audioFramesSinceSync;
-
-      if (gap > 0) {
-        // Skip ahead nếu bị trễ quá xa (event loop stall)
-        if (gap > 5) {
-          const skip = gap - 1;
-          const skipBytes = Math.min(
-            skip * AUDIO_FRAME_BYTES,
-            audioBuffer.length
-          ) & ~1;
-
-          audioBuffer = audioBuffer.subarray(skipBytes);
-          audioFramesSinceSync += skip;
-
-          console.log("[AUDIO] Skip ahead", skip, "frames");
-        }
-
-        // Emit tối đa 2 frame mỗi tick để tránh burst lớn
-        const emitCount = Math.min(gap, 2);
-
-        for (let i = 0; i < emitCount; i++) {
-          const frame = takeAudioFrame();
-          writeAudioFrame(frame, false);
-          audioFramesSinceSync++;
-        }
-      }
+  // 1) Priming check — không cần client
+  if (!audioPrimed) {
+    const targetBytes = Math.floor(
+      AUDIO_BYTES_PER_MS * audioTargetBufferMs
+    );
+    if (audioBuffer.length >= targetBytes) {
+      audioPrimed = true;
+      console.log(
+        "[AUDIO] Primed:", audioBuffer.length,
+        "bytes / target:", audioTargetBufferMs, "ms"
+      );
     }
-  } else if (audioClient && (audioClient.destroyed || audioClient.writableEnded)) {
-    disconnectAudioClient();
   }
 
-  if (audioBlocked && Date.now() - audioBlockedSince > MAX_AUDIO_BLOCK_MS) {
-    console.log("[AUDIO] Slow client disconnected");
-    disconnectAudioClient();
+  if (!videoPrimed && videoQueue.length >= VIDEO_QUEUE_TARGET) {
+    videoPrimed = true;
+    console.log("[VIDEO] Primed:", videoQueue.length, "frames");
   }
 
-  // --- 2) Sync epoch setup ---
+  // 2) Sync epoch
   if (audioPrimed && videoPrimed && syncEpoch === 0) {
     syncEpoch = now;
     audioFramesSinceSync = 0;
     videoFramesSinceSync = 0;
     lastDriftCheck = now;
-
     console.log("[SYNC] Playback started at", now);
   }
 
-  // --- 3) Video priming ---
-  if (
-    !videoPrimed &&
-    videoQueue.length >= VIDEO_QUEUE_TARGET
-  ) {
-    videoPrimed = true;
-    console.log(
-      "[VIDEO] Primed:", videoQueue.length, "frames"
-    );
+  // 3) Audio emission — luôn chạy khi primed + epoch, discard nếu chưa ready
+  if (audioPrimed && syncEpoch > 0) {
+    const expected = Math.floor((now - syncEpoch) / AUDIO_INTERVAL);
+    const gap = expected - audioFramesSinceSync;
+
+    if (gap > 0) {
+      if (gap > 5) {
+        const skip = gap - 1;
+        const skipBytes = Math.min(
+          skip * AUDIO_FRAME_BYTES, audioBuffer.length
+        ) & ~1;
+        audioBuffer = audioBuffer.subarray(skipBytes);
+        audioFramesSinceSync += skip;
+        console.log("[AUDIO] Skip ahead", skip, "frames");
+      }
+
+      const emitCount = Math.min(gap, 2);
+
+      for (let i = 0; i < emitCount; i++) {
+        const frame = takeAudioFrame();
+        audioFramesSinceSync++;
+
+        // Chỉ gửi client khi streamReady + có client + không bị block
+        if (
+          streamReady &&
+          audioClient &&
+          !audioClient.destroyed &&
+          !audioClient.writableEnded &&
+          !audioBlocked
+        ) {
+          writeAudioFrame(frame, false);
+        }
+      }
+    }
   }
 
-  // --- 4) Video emission theo wall clock ---
-  if (videoPrimed && audioPrimed && syncEpoch > 0 && videoQueue.length > 0) {
+  if (
+    audioClient &&
+    (audioClient.destroyed || audioClient.writableEnded)
+  ) {
+    disconnectAudioClient(false);
+  }
+
+  if (
+    audioClient &&
+    audioBlocked &&
+    Date.now() - audioBlockedSince > MAX_AUDIO_BLOCK_MS
+  ) {
+    console.log("[AUDIO] Slow client disconnected");
+    disconnectAudioClient(false);
+  }
+
+  // 4) Video emission — luôn chạy khi primed + epoch, discard nếu chưa ready
+  if (videoPrimed && audioPrimed && syncEpoch > 0) {
     const expected = Math.floor((now - syncEpoch) / VIDEO_INTERVAL);
     const gap = expected - videoFramesSinceSync;
 
-    if (gap > 0) {
+    if (gap > 0 && videoQueue.length > 0) {
       const emitCount = Math.min(gap, videoQueue.length, 3);
 
       for (let i = 0; i < emitCount; i++) {
         const frame = videoQueue.shift();
         if (!frame) break;
 
-        latestFrame = frame;
-        frameSequence++;
-        lastVideoFrameTime = Date.now();
-
-        broadcastFrame(frame);
         videoFramesSinceSync++;
+
+        if (streamReady) {
+          latestFrame = frame;
+          frameSequence++;
+          lastVideoFrameTime = Date.now();
+          broadcastFrame(frame);
+        }
       }
     }
   }
 
-  // --- 5) Drift safety net ---
+  // 5) StreamReady gate
+  if (!streamReady && audioPrimed && videoPrimed && syncEpoch > 0) {
+    if (now - syncEpoch >= STREAM_READY_GRACE_MS) {
+      setStreamReady();
+    }
+  }
+
+  // 6) Drift safety
   checkDrift();
 }
 
@@ -890,7 +867,6 @@ function stopFFmpeg({
   disconnectClients = true
 } = {}) {
   generation++;
-
   manuallyStopped = manual;
   restarting = false;
 
@@ -907,6 +883,7 @@ function stopFFmpeg({
   clearAudioBuffer();
   clearVideoBuffer();
   resetSync();
+  resetStreamReady("stopFFmpeg");
 
   audioBlocked = false;
   audioBlockedSince = 0;
@@ -916,7 +893,7 @@ function stopFFmpeg({
   }
 
   if (disconnectClients) {
-    disconnectAudioClient();
+    disconnectAudioClient(true);
 
     for (const res of videoClientsMap.keys()) {
       try { res.destroy(); } catch (_) {}
@@ -933,10 +910,7 @@ function startFFmpeg(channel) {
     return;
   }
 
-  stopFFmpeg({
-    manual: false,
-    disconnectClients: false
-  });
+  stopFFmpeg({ manual: false, disconnectClients: false });
 
   manuallyStopped = false;
   currentChannel = channel;
@@ -944,6 +918,7 @@ function startFFmpeg(channel) {
   clearVideoBuffer();
   resetAudioState(true);
   resetSync();
+  resetStreamReady("startFFmpeg");
 
   videoDroppedFrames = 0;
   videoInvalidFrames = 0;
@@ -958,23 +933,16 @@ function startFFmpeg(channel) {
   console.log("\n==================================");
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
-  console.log(
-    "VIDEO:",
-    `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS} (max)`
-  );
-  console.log(
-    "QUALITY:",
-    qualityPreset.label,
-    "JPEG q:",
-    qualityPreset.jpegQuality
-  );
+  console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS} (max)`);
+  console.log("QUALITY:", qualityPreset.label, "JPEG q:", qualityPreset.jpegQuality);
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
+  console.log("AUDIO BUFFER MAX:", AUDIO_BUFFER_MS, "ms");
   console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
   console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
-  console.log("SYNC TRIM THRESHOLD:", SYNC_TRIM_MS, "ms");
+  console.log("STREAM READY GRACE:", STREAM_READY_GRACE_MS, "ms");
   console.log("MASTER TICK:", MASTER_TICK_MS, "ms");
-  console.log("MODE: EPOCH-BASED WALL CLOCK (ZERO DRIFT)");
+  console.log("MODE: EPOCH-BASED + STREAM GATE");
   console.log("==================================");
 
   const videoFilter = [
@@ -987,24 +955,18 @@ function startFFmpeg(channel) {
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
-
     "-probesize", "1000000",
     "-analyzeduration", "1000000",
-
     "-rw_timeout", "30000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-
     "-re",
-
     "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
-
     "-i", channel.url,
-
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
@@ -1016,7 +978,6 @@ function startFFmpeg(channel) {
     "-flush_packets", "1",
     "-f", "image2pipe",
     "pipe:1",
-
     "-map", "0:a:0?",
     "-vn",
     "-af",
@@ -1065,13 +1026,13 @@ function startFFmpeg(channel) {
 
   child.on("close", (code, signal) => {
     console.log("[FFmpeg] Exited:", code, signal);
-
     if (currentGeneration !== generation) return;
     if (ffmpeg === child) ffmpeg = null;
 
     clearAudioBuffer();
     clearVideoBuffer();
     resetSync();
+    resetStreamReady("ffmpeg exit");
 
     if (!manuallyStopped) scheduleRestart();
   });
@@ -1080,7 +1041,6 @@ function startFFmpeg(channel) {
     if (currentGeneration !== generation || !ffmpeg || restarting) return;
 
     const elapsed = Date.now() - lastVideoFrameReceived;
-
     if (elapsed > VIDEO_TIMEOUT) {
       console.log("[WATCHDOG] No video frame for", elapsed, "ms");
       scheduleRestart();
@@ -1103,6 +1063,7 @@ function scheduleRestart() {
   clearAudioBuffer();
   clearVideoBuffer();
   resetSync();
+  resetStreamReady("scheduleRestart");
 
   audioBlocked = false;
   audioBlockedSince = 0;
@@ -1124,10 +1085,10 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM
+// VIDEO STREAM — CHỜ STREAM READY RỒI MỚI TRẢ RESPONSE
 // =====================================================
 
-app.get("/stream", (req, res) => {
+app.get("/stream", async (req, res) => {
   const requestedFps = Number(req.query.fps);
 
   let clientFps = DEFAULT_CLIENT_FPS;
@@ -1144,11 +1105,21 @@ app.get("/stream", (req, res) => {
     : (1000 / clientFps);
 
   console.log(
-    "[VIDEO] Client connected - requested fps:",
-    req.query.fps || "default",
-    "→ effective fps:",
-    clientFps
+    "[VIDEO] Client request — fps:", clientFps,
+    "— waiting for streamReady..."
   );
+
+  const ready = await waitForStreamReady(STREAM_READY_TIMEOUT_MS);
+
+  if (!ready) {
+    console.log("[VIDEO] Stream not ready after timeout — 503");
+    return res.status(503).json({
+      success: false,
+      error: "Stream not ready — try again"
+    });
+  }
+
+  console.log("[VIDEO] Client connected — streamReady=true");
 
   res.writeHead(200, {
     "Content-Type": "multipart/x-mixed-replace; boundary=frame",
@@ -1176,7 +1147,6 @@ app.get("/stream", (req, res) => {
   videoClientsMap.set(res, state);
 
   if (
-    videoPrimed &&
     latestFrame &&
     Date.now() - lastVideoFrameTime <= 1500 &&
     frameSequence > 0
@@ -1195,7 +1165,6 @@ app.get("/stream", (req, res) => {
 
       state.lastSentSequence = frameSequence;
       state.lastSentTime = Date.now();
-
       videoSentFrames++;
     } catch (_) {}
   }
@@ -1205,34 +1174,45 @@ app.get("/stream", (req, res) => {
 });
 
 // =====================================================
-// AUDIO STREAM
+// AUDIO STREAM — CHỜ STREAM READY
 // =====================================================
 
-app.get("/audio", (req, res) => {
-  disconnectAudioClient();
-  resetAudioState(false);
+app.get("/audio", async (req, res) => {
+  console.log("[AUDIO] Client request — waiting for streamReady...");
+
+  const ready = await waitForStreamReady(STREAM_READY_TIMEOUT_MS);
+
+  if (!ready) {
+    console.log("[AUDIO] Stream not ready after timeout — 503");
+    return res.status(503).json({
+      success: false,
+      error: "Stream not ready — try again"
+    });
+  }
+
+  console.log("[AUDIO] Client connected — streamReady=true");
+
+  // Disconnect client cũ (nếu có) nhưng GIỮ buffer + primed state
+  disconnectAudioClient(false);
 
   audioClient = res;
 
   res.statusCode = 200;
-
   res.setHeader("Content-Type", "application/octet-stream");
   res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  console.log("[AUDIO] Client connected; silence until primed");
-
   res.on("close", () => {
     if (audioClient === res) {
       console.log("[AUDIO] Client disconnected");
-      disconnectAudioClient();
+      disconnectAudioClient(false);
     }
   });
 
   res.on("error", () => {
-    if (audioClient === res) disconnectAudioClient();
+    if (audioClient === res) disconnectAudioClient(false);
   });
 });
 
@@ -1273,26 +1253,19 @@ app.post("/api/config/quality/:quality", qualityConfigHandler);
 
 app.get("/api/channels", (req, res) => {
   const requested =
-    req.query.quality ||
-    req.query.q ||
-    req.query.max ||
-    "720";
+    req.query.quality || req.query.q || req.query.max || "720";
 
   const rawValue = String(requested).trim().toLowerCase();
-
   let maxResolution = 720;
 
   if (rawValue === "all" || rawValue === "full") {
     maxResolution = Number.MAX_SAFE_INTEGER;
   } else {
     const parsed = Number.parseInt(rawValue, 10);
-    if (Number.isFinite(parsed) && parsed > 0) {
-      maxResolution = parsed;
-    }
+    if (Number.isFinite(parsed) && parsed > 0) maxResolution = parsed;
   }
 
   const filtered = filterChannelsByResolution(channels, maxResolution);
-
   const resetSeconds = Math.max(3, Math.ceil(RESTART_DELAY / 1000));
 
   res.json({
@@ -1300,8 +1273,7 @@ app.get("/api/channels", (req, res) => {
     streamQuality: getCurrentQualityPreset().id,
     jpegQuality: getCurrentQualityPreset().jpegQuality,
     quality: maxResolution === Number.MAX_SAFE_INTEGER
-      ? "all"
-      : String(maxResolution),
+      ? "all" : String(maxResolution),
     channels: filtered.map(channel => ({
       ...channel,
       resetSeconds,
@@ -1311,7 +1283,7 @@ app.get("/api/channels", (req, res) => {
 });
 
 // =====================================================
-// API SELECT
+// API SELECT / STOP / RELOAD
 // =====================================================
 
 function selectChannelHandler(req, res) {
@@ -1351,27 +1323,14 @@ function selectChannelHandler(req, res) {
 app.get("/api/select/:id", selectChannelHandler);
 app.post("/api/select/:id", selectChannelHandler);
 
-// =====================================================
-// API STOP
-// =====================================================
-
 function stopHandler(req, res) {
-  stopFFmpeg({
-    manual: true,
-    disconnectClients: true
-  });
-
+  stopFFmpeg({ manual: true, disconnectClients: true });
   currentChannel = null;
-
   res.json({ success: true, message: "Stopped" });
 }
 
 app.get("/api/stop", stopHandler);
 app.post("/api/stop", stopHandler);
-
-// =====================================================
-// API RELOAD
-// =====================================================
 
 app.get("/api/reload", async (req, res) => {
   try {
@@ -1405,10 +1364,7 @@ app.get("/api/bandwidth", async (req, res) => {
       });
     }
 
-    if (
-      !Number.isFinite(BANDWIDTH_LIMIT_GB) ||
-      BANDWIDTH_LIMIT_GB <= 0
-    ) {
+    if (!Number.isFinite(BANDWIDTH_LIMIT_GB) || BANDWIDTH_LIMIT_GB <= 0) {
       return res.status(500).json({
         success: false,
         error: "Invalid BANDWIDTH_LIMIT_GB"
@@ -1416,13 +1372,11 @@ app.get("/api/bandwidth", async (req, res) => {
     }
 
     const now = new Date();
-
     const start = new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
     );
 
     const url = new URL("https://api.render.com/v1/metrics/bandwidth");
-
     url.searchParams.set("startTime", start.toISOString());
     url.searchParams.set("endTime", now.toISOString());
 
@@ -1449,7 +1403,6 @@ app.get("/api/bandwidth", async (req, res) => {
     }
 
     const data = await response.json();
-
     if (!Array.isArray(data)) {
       throw new Error("Invalid Render bandwidth response");
     }
@@ -1482,7 +1435,6 @@ app.get("/api/bandwidth", async (req, res) => {
       }
 
       usedGB += serviceGB;
-
       services.push({
         serviceId,
         usedGB: Number(serviceGB.toFixed(4)),
@@ -1492,23 +1444,17 @@ app.get("/api/bandwidth", async (req, res) => {
     }
 
     usedGB = Number(usedGB.toFixed(4));
-
     const remainingGB = Math.max(0, BANDWIDTH_LIMIT_GB - usedGB);
-
     const resetAt = new Date(
       Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)
     );
-
     const resetInSeconds = Math.max(
-      0,
-      Math.ceil((resetAt.getTime() - Date.now()) / 1000)
+      0, Math.ceil((resetAt.getTime() - Date.now()) / 1000)
     );
 
     const usedPercent = Math.min(
-      100,
-      Number((usedGB / BANDWIDTH_LIMIT_GB * 100).toFixed(2))
+      100, Number((usedGB / BANDWIDTH_LIMIT_GB * 100).toFixed(2))
     );
-
     const remainingPercent = Number((100 - usedPercent).toFixed(2));
 
     let status = "NORMAL";
@@ -1584,7 +1530,7 @@ app.get("/health", (req, res) => {
     ffmpegRunning: !!ffmpeg,
     restarting,
     manuallyStopped,
-    pipeline: "EPOCH_WALLCLOCK_MJPEG_PCM",
+    pipeline: "EPOCH_WALLCLOCK_MJPEG_PCM_GATED",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1592,6 +1538,12 @@ app.get("/health", (req, res) => {
     defaultClientFps: DEFAULT_CLIENT_FPS,
     skipThresholdMs: CLIENT_SKIP_THRESHOLD_MS,
     maxClientBlockMs: MAX_CLIENT_BLOCK_MS,
+
+    streamReady,
+    streamReadyAt,
+    streamReadyAgeMs: streamReadyAt ? now - streamReadyAt : null,
+    streamReadyGraceMs: STREAM_READY_GRACE_MS,
+    streamReadyWaiters: streamReadyWaiters.length,
 
     videoPrimed,
     videoQueueLength: videoQueue.length,
@@ -1664,12 +1616,13 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - EPOCH-BASED SYNC (ZERO DRIFT)\n" +
+    "IPTV SERVER RUNNING - EPOCH SYNC + STREAM GATE\n" +
     "Usage:\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
     "  /audio               → PCM audio\n" +
-    "\nEpoch-based emission guarantees zero A/V drift over long playback."
+    "\nStream/audio endpoints HOLD until buffer is stable.\n" +
+    "Client receives smooth content from the very first byte."
   );
 });
 
@@ -1684,7 +1637,6 @@ async function main() {
     console.log("[STARTUP] Playlist failed:", error.message);
   }
 
-  // Master timer duy nhất — chạy suốt vòng đời server
   startMasterTimer();
 
   app.listen(PORT, "0.0.0.0", () => {
@@ -1692,16 +1644,14 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log(
-      "VIDEO:",
-      `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`
-    );
+    console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
     console.log("MASTER TICK:", MASTER_TICK_MS, "ms");
     console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
     console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
     console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
-    console.log("SYNC TRIM THRESHOLD:", SYNC_TRIM_MS, "ms");
-    console.log("PIPELINE: EPOCH-BASED WALL CLOCK");
+    console.log("AUDIO BUFFER MAX:", AUDIO_BUFFER_MS, "ms");
+    console.log("STREAM READY GRACE:", STREAM_READY_GRACE_MS, "ms");
+    console.log("PIPELINE: EPOCH + STREAM GATE");
     console.log("--------------------------------");
   });
 
