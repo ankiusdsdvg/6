@@ -22,6 +22,11 @@ const DEFAULT_CLIENT_FPS = 12;
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
 
+// Termux/mobile servers need a short live buffer. A large startup queue makes
+// the ESP32 wait several seconds before it receives the first useful frame and
+// also allows the phone to build a stale TCP backlog when decoding is busy.
+const LOW_LATENCY_MODE = process.env.TV_LOW_LATENCY !== "0";
+
 const JPEG_QUALITY = 10;
 const JPEG_QUALITY_720P = 15;
 const JPEG_QUALITY_540P = 20;
@@ -60,8 +65,8 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-const AUDIO_START_BUFFER_MS = 1000;
-const AUDIO_BUFFER_MS = 3500;
+const AUDIO_START_BUFFER_MS = LOW_LATENCY_MODE ? 350 : 1000;
+const AUDIO_BUFFER_MS = LOW_LATENCY_MODE ? 1800 : 3500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -72,8 +77,8 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 500;
-const AUDIO_TARGET_MAX_MS = 1400;
+const AUDIO_TARGET_MIN_MS = LOW_LATENCY_MODE ? 250 : 500;
+const AUDIO_TARGET_MAX_MS = LOW_LATENCY_MODE ? 900 : 1400;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
 const DECODER_THREADS = 2;
@@ -97,11 +102,11 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 // Master timer — gộp audio + video vào 1 nhịp duy nhất, tính từ wall clock
 const MASTER_TICK_MS = 10;
 
-const VIDEO_QUEUE_TARGET = 12;
-const VIDEO_QUEUE_MAX = 20;
+const VIDEO_QUEUE_TARGET = LOW_LATENCY_MODE ? 3 : 12;
+const VIDEO_QUEUE_MAX = LOW_LATENCY_MODE ? 6 : 20;
 
 // Nếu video queue "già" hơn audio buffer quá ngưỡng này → drop frame cũ
-const SYNC_TRIM_MS = 300;
+const SYNC_TRIM_MS = LOW_LATENCY_MODE ? 180 : 300;
 
 // Drift tối đa (chỉ dùng làm safety net, không nên trigger với epoch-based)
 const MAX_SYNC_DRIFT_MS = 800;
@@ -973,6 +978,7 @@ function startFFmpeg(channel) {
   console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
   console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
   console.log("SYNC TRIM THRESHOLD:", SYNC_TRIM_MS, "ms");
+  console.log("LOW LATENCY:", LOW_LATENCY_MODE ? "ON" : "OFF");
   console.log("MASTER TICK:", MASTER_TICK_MS, "ms");
   console.log("MODE: EPOCH-BASED WALL CLOCK (ZERO DRIFT)");
   console.log("==================================");
@@ -988,8 +994,10 @@ function startFFmpeg(channel) {
     "-loglevel", "warning",
     "-nostdin",
 
-    "-probesize", "1000000",
-    "-analyzeduration", "1000000",
+    // Keep input probing short. This is important for HLS/HTTP sources on a
+    // phone: waiting for a large probe is perceived as a 10-20 second startup.
+    "-probesize", LOW_LATENCY_MODE ? "256000" : "1000000",
+    "-analyzeduration", LOW_LATENCY_MODE ? "500000" : "1000000",
 
     "-rw_timeout", "30000000",
     "-reconnect", "1",
@@ -997,9 +1005,14 @@ function startFFmpeg(channel) {
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
 
-    "-re",
-
-    "-fflags", "+discardcorrupt+genpts",
+    // The source is already live. Do not throttle FFmpeg with -re, otherwise
+    // packets received in a burst can sit in the decoder queue before output.
+    "-fflags", LOW_LATENCY_MODE
+      ? "+discardcorrupt+genpts+nobuffer"
+      : "+discardcorrupt+genpts",
+    "-flags", LOW_LATENCY_MODE ? "+low_delay" : "0",
+    "-avioflags", LOW_LATENCY_MODE ? "direct" : "0",
+    "-max_delay", LOW_LATENCY_MODE ? "0" : "-1",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
 
@@ -1590,6 +1603,7 @@ app.get("/health", (req, res) => {
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
     defaultClientFps: DEFAULT_CLIENT_FPS,
+    lowLatencyMode: LOW_LATENCY_MODE,
     skipThresholdMs: CLIENT_SKIP_THRESHOLD_MS,
     maxClientBlockMs: MAX_CLIENT_BLOCK_MS,
 
