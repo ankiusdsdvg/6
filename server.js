@@ -49,7 +49,7 @@ const AUDIO_BYTES_PER_SAMPLE = 2;
 const AUDIO_FRAME_MS = 200;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 
-// Audio tick RIÊNG (không dùng masterTick video) — chạy mỗi 50ms
+// Audio tick riêng — không dùng masterTick video
 const AUDIO_TICK_MS = 50;
 
 const AUDIO_FRAME_BYTES =
@@ -63,12 +63,11 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Prime 4s audio — trade-off: client chờ thêm ~2.5s so với bản gốc,
-// nhưng audio mượt từ frame đầu thay vì 15-20s sau
-const AUDIO_START_BUFFER_MS = 4000;
+// Prime 3s — đủ slack ngay từ đầu, không cần chờ 15-20s
+const AUDIO_START_BUFFER_MS = 3000;
 
-// Buffer max 12s — đủ chứa burst từ -readrate 1.4 khi vượt TCP slow-start
-const AUDIO_BUFFER_MS = 12000;
+// Buffer max 8s — thoải mái cho jitter 4G
+const AUDIO_BUFFER_MS = 8000;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -76,14 +75,14 @@ const AUDIO_BUFFER_MAX =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_BUFFER_MS / 1000;
 
-// Prebuffer tối thiểu trước khi bắt đầu gửi cho client trong /audio
+// /audio chờ đủ 1500ms buffer trước khi gửi client
 const AUDIO_PREBUFFER_MS = 1500;
 
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
 const AUDIO_TARGET_MIN_MS = 800;
-const AUDIO_TARGET_MAX_MS = 8000;
+const AUDIO_TARGET_MAX_MS = 6000;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
 const DECODER_THREADS = 1;
@@ -100,10 +99,6 @@ const CLIENT_SKIP_THRESHOLD_MS = 300;
 const MAX_CLIENT_BLOCK_MS = 3000;
 const MAX_AUDIO_BLOCK_MS = 1500;
 
-// FFmpeg readrate: 1.4 = đọc nhanh hơn realtime 40% để vượt TCP slow-start.
-// Có thể override qua env: FFMPEG_READRATE=2.0
-const FFMPEG_READRATE = String(process.env.FFMPEG_READRATE || "1.4");
-
 // =====================================================
 // MASTER TIMER / VIDEO QUEUE / SYNC / STREAM READY
 // =====================================================
@@ -111,7 +106,7 @@ const FFMPEG_READRATE = String(process.env.FFMPEG_READRATE || "1.4");
 const MASTER_TICK_MS = 10;
 
 const VIDEO_QUEUE_TARGET = 18;
-const VIDEO_QUEUE_MAX = 60;   // 5s max (trước 42) — đủ cho readrate 1.4
+const VIDEO_QUEUE_MAX = 42;
 
 const SYNC_TRIM_MS = 300;
 const MAX_SYNC_DRIFT_MS = 800;
@@ -579,7 +574,7 @@ function writeAudioFrame(frame, isSilence = false) {
 }
 
 // =====================================================
-// AUDIO TICK — RIÊNG, KHÔNG PHỤ THUỘC MASTER TICK VIDEO
+// AUDIO TICK — RIÊNG, KHÔNG PHỤ THUỘC VIDEO
 // =====================================================
 
 function audioTick() {
@@ -591,7 +586,7 @@ function audioTick() {
 
   if (gap <= 0) return;
 
-  // Nếu gap quá lớn (event loop bị block) → skip để tránh burst quá lớn
+  // Nếu gap quá lớn (event loop bị block) → skip để tránh burst
   if (gap > 20) {
     const skip = gap - 20;
     const skipBytes = Math.min(skip * AUDIO_FRAME_BYTES, audioBuffer.length) & ~1;
@@ -611,8 +606,7 @@ function audioTick() {
       !audioClient.destroyed &&
       !audioClient.writableEnded
     ) {
-      // Luôn ghi kể cả khi blocked — để TCP tự buffer, tránh câm kéo dài.
-      // Chỉ reset client nếu block > 1500ms (đã handle trong writeAudioFrame).
+      // Luôn ghi kể cả khi blocked — TCP tự buffer, tránh câm giữa chừng
       writeAudioFrame(frame, false);
     }
   }
@@ -797,8 +791,7 @@ function processVideoData(chunk, currentGeneration) {
 }
 
 // =====================================================
-// MASTER TICK — CHỈ XỬ LÝ VIDEO + PRIMING + STREAM GATE
-// (audio đã tách sang audioTick riêng)
+// MASTER TICK — VIDEO + PRIMING + STREAM GATE
 // =====================================================
 
 function masterTick() {
@@ -979,8 +972,7 @@ function startFFmpeg(channel) {
   console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
   console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
   console.log("STREAM READY GRACE:", STREAM_READY_GRACE_MS, "ms");
-  console.log("FFMPEG READRATE:", FFMPEG_READRATE);
-  console.log("MODE: SPLIT AUDIO/VIDEO TICK + READRATE > 1");
+  console.log("MODE: SPLIT TICK + SAFE FFMPEG FLAGS");
   console.log("==================================");
 
   const videoFilter = [
@@ -989,27 +981,30 @@ function startFFmpeg(channel) {
     "setsar=1"
   ].join(",");
 
-  // Audio filter đơn giản: async=1 = compensate ngay khi lệch > 1ms
-  // (thay cho async=75:min_hard_comp=0.200 — gây chậm 15-20s khi lock)
+  // Audio filter an toàn cho IPTV:
+  // - async=1000 (1000 samples ≈ 62ms) — compensate nhẹ nhàng
+  // - first_pts=0 — bắt đầu từ 0
+  // KHÔNG dùng async=1 (quá aggressive, gây stall)
   const audioFilter =
-    `aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0`;
+    `aresample=${AUDIO_SAMPLE_RATE}:async=1000:first_pts=0`;
 
   const args = [
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
+    // Probesize/analyzeduration đủ lớn để detect audio — KHÔNG giảm
     "-probesize", "1000000",
     "-analyzeduration", "1000000",
-    "-rw_timeout", "15000000",
+    "-rw_timeout", "20000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    // readrate > 1 để vượt TCP slow-start trên 4G trong 15-20s đầu
-    "-readrate", FFMPEG_READRATE,
-    "-use_wallclock_as_timestamps", "1",
-    "-fflags", "+discardcorrupt+genpts+igndts",
-    "-avoid_negative_ts", "make_zero",
+    // -re = đọc đúng realtime — an toàn, không gây drop frame
+    "-re",
+    // Chỉ giữ genpts + discardcorrupt (an toàn cho IPTV)
+    // KHÔNG thêm igndts, use_wallclock, avoid_negative_ts — gây stall
+    "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
     "-i", channel.url,
@@ -1237,7 +1232,7 @@ app.get("/stream", async (req, res) => {
 });
 
 // =====================================================
-// AUDIO STREAM — PREBUFFER TRƯỚC KHI GỬI
+// AUDIO STREAM — PREBUFFER
 // =====================================================
 
 app.get("/audio", async (req, res) => {
@@ -1253,8 +1248,7 @@ app.get("/audio", async (req, res) => {
     });
   }
 
-  // Chờ thêm cho đến khi buffer đủ AUDIO_PREBUFFER_MS trước khi gửi
-  // (đảm bảo client có continuous stream từ byte đầu)
+  // Chờ buffer đủ AUDIO_PREBUFFER_MS trước khi gửi
   const prebufferTarget = Math.floor(AUDIO_BYTES_PER_MS * AUDIO_PREBUFFER_MS);
   const waitStart = Date.now();
 
@@ -1618,8 +1612,7 @@ app.get("/health", (req, res) => {
     ffmpegRunning: !!ffmpeg,
     restarting,
     manuallyStopped,
-    pipeline: "SPLIT_TICK_EPOCH_MJPEG_PCM",
-    ffmpegReadrate: FFMPEG_READRATE,
+    pipeline: "SPLIT_TICK_SAFE_FFMPEG",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1651,8 +1644,7 @@ app.get("/health", (req, res) => {
       expectedAudioKbPerSec: Number(expectedAudioKbPerSec.toFixed(2)),
       audioProductionRate,
       videoInFps: Number(videoInFps.toFixed(2)),
-      videoProductionRate,
-      note: "<100% nghĩa là mạng chậm hơn FFmpeg cần → giảm chất lượng hoặc tăng FFMPEG_READRATE"
+      videoProductionRate
     },
 
     videoPrimed,
@@ -1728,12 +1720,12 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - SPLIT TICK + READRATE + PREBUFFER\n" +
+    "IPTV SERVER RUNNING - SPLIT TICK + SAFE FFMPEG\n" +
     "Usage:\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
     "  /audio               → PCM audio (prebuffered)\n" +
-    "\nAudio pipeline tách riêng khỏi video tick để đảm bảo mượt từ đầu."
+    "\nAudio pipeline tách riêng + FFmpeg flags an toàn cho IPTV."
   );
 });
 
@@ -1764,8 +1756,7 @@ async function main() {
     console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
     console.log("AUDIO BUFFER MAX:", AUDIO_BUFFER_MS, "ms");
     console.log("AUDIO PREBUFFER:", AUDIO_PREBUFFER_MS, "ms");
-    console.log("FFMPEG READRATE:", FFMPEG_READRATE);
-    console.log("PIPELINE: SPLIT TICK + READRATE");
+    console.log("PIPELINE: SPLIT TICK + SAFE FLAGS");
     console.log("--------------------------------");
   });
 
