@@ -30,11 +30,11 @@ let currentQualityId = '1080p';
 
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
-const AUDIO_FRAME_MS = 20; // 20 ms PCM packets reduce latency and smooth client playback
+const AUDIO_FRAME_MS = 200; // Preserve the original 200 ms PCM chunk cadence for player compatibility
 const AUDIO_FRAME_BYTES = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * 2 * AUDIO_FRAME_MS / 1000;
-const AUDIO_BUFFER_MAX_MS = 1200;
+const AUDIO_BUFFER_MAX_MS = 3000;
 const AUDIO_BUFFER_MAX_BYTES = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * 2 * AUDIO_BUFFER_MAX_MS / 1000;
-const AUDIO_START_BUFFER_MS = 400;
+const AUDIO_START_BUFFER_MS = 1000;
 
 const VIDEO_QUEUE_TARGET = 3; // 250 ms at 12 fps
 const VIDEO_QUEUE_MAX = 8;
@@ -43,13 +43,13 @@ const MASTER_TICK_MS = 10;
 
 // Start video once it is primed. Give audio a short chance to prime so A/V
 // starts together, but never let a missing/late audio track hold video forever.
-const AUDIO_START_GRACE_MS = 1400;
+const AUDIO_START_GRACE_MS = 1800;
 const STREAM_READY_GRACE_MS = 100;
 const STREAM_READY_TIMEOUT_MS = 8000;
 
 const WATCHDOG_INTERVAL = 5000;
-const VIDEO_TIMEOUT = 45000;
-const RESTART_DELAY = 3000;
+const VIDEO_TIMEOUT = 12000;
+const RESTART_DELAY = 1500;
 const MAX_JPEG_FRAME_BYTES = 512 * 1024;
 const MAX_VIDEO_PENDING_BYTES = 1024 * 1024;
 const CLIENT_SKIP_THRESHOLD_MS = 300;
@@ -531,7 +531,7 @@ function startFFmpeg(channel) {
   const args = [
     '-hide_banner', '-loglevel', 'warning', '-nostdin',
     '-probesize', '500000', '-analyzeduration', '500000',
-    '-rw_timeout', '30000000',
+    '-rw_timeout', '8000000',
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-user_agent', 'Mozilla/5.0',
     '-fflags', '+discardcorrupt+genpts',
@@ -546,7 +546,7 @@ function startFFmpeg(channel) {
     '-r', String(VIDEO_FPS), '-fps_mode', 'cfr',
     '-flush_packets', '1', '-f', 'image2pipe', 'pipe:1',
 
-    '-map', '0:a:0?', '-vn',
+    '-map', '0:a:0?', '-vn', '-c:a', 'pcm_s16le',
     '-af', `aresample=${AUDIO_SAMPLE_RATE}:async=100:first_pts=0`,
     '-ac', String(AUDIO_CHANNELS), '-ar', String(AUDIO_SAMPLE_RATE),
     '-c:a', 'pcm_s16le', '-flush_packets', '1',
@@ -560,7 +560,9 @@ function startFFmpeg(channel) {
   child.stdout.on('data', chunk => processVideoData(chunk, gen));
   if (child.stdio[3]) {
     child.stdio[3].on('data', chunk => {
-      if (gen === generation) pushAudio(chunk);
+      if (gen === generation) {
+        pushAudio(chunk);
+      }
     });
     child.stdio[3].on('error', e => {
       if (gen === generation) console.warn('[AUDIO PIPE]', e.message);
@@ -822,7 +824,7 @@ app.get('/health', (req, res) => {
     channelCount: channels.length,
     currentChannel: currentChannel ? currentChannel.name : null,
     ffmpegRunning: !!ffmpeg, restarting, manuallyStopped,
-    pipeline: 'LOW_LATENCY_MJPEG_PCM_SHARED_EPOCH',
+    pipeline: 'MJPEG_PCM_COMPAT_200MS_SHARED_EPOCH',
     videoWidth: VIDEO_WIDTH, videoHeight: VIDEO_HEIGHT, videoFPS: VIDEO_FPS,
     streamReady, streamReadyAt,
     streamReadyWaiters: readyWaiters.length,
