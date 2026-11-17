@@ -60,10 +60,10 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Buffer khởi động — giảm mạnh để có start nhanh trên Termux / 4G
+// Startup buffer — giảm để start nhanh nhưng vẫn đủ cho audio
 const AUDIO_START_BUFFER_MS = 300;
 
-// Buffer tối đa — khớp với VIDEO_QUEUE_MAX (2s) để A/V cân
+// Buffer tối đa — khớp VIDEO_QUEUE_MAX (2s)
 const AUDIO_BUFFER_MS = 2000;
 
 const AUDIO_BUFFER_MAX =
@@ -99,15 +99,13 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 
 const MASTER_TICK_MS = 10;
 
-// Giảm target xuống 4 frames (~333ms) để start nhanh
 const VIDEO_QUEUE_TARGET = 4;
-const VIDEO_QUEUE_MAX = 24;   // 2s — khớp AUDIO_BUFFER_MS
+const VIDEO_QUEUE_MAX = 24;
 
 const SYNC_TRIM_MS = 300;
 const MAX_SYNC_DRIFT_MS = 800;
 
-// Streaming gate — chỉ mở khi đã "ổn định"
-const STREAM_READY_GRACE_MS = 150;    // giảm từ 500 → 150
+const STREAM_READY_GRACE_MS = 150;
 const STREAM_READY_TIMEOUT_MS = 25000;
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
@@ -184,6 +182,8 @@ let manuallyStopped = true;
 let ffmpegStartTime = 0;
 let firstVideoByteAt = 0;
 let firstAudioByteAt = 0;
+let audioDetected = false;
+let audioDetectWarned = false;
 
 // =====================================================
 // STREAM READY — GATE
@@ -430,8 +430,6 @@ function clearAudioBuffer() {
   audioStableFrames = 0;
 }
 
-// clearBuffer = false: giữ buffer + primed state (dùng khi client reconnect
-// hoặc khi /audio accept sau streamReady)
 function disconnectAudioClient(clearBuffer = true) {
   const old = audioClient;
 
@@ -710,7 +708,6 @@ function processVideoData(chunk, currentGeneration) {
 
     lastVideoFrameReceived = Date.now();
 
-    // Sync trim
     if (videoPrimed && audioPrimed) {
       const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
       const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
@@ -732,13 +729,13 @@ function processVideoData(chunk, currentGeneration) {
 }
 
 // =====================================================
-// MASTER TICK — AUDIO + VIDEO EMISSION DUY NHẤT
+// MASTER TICK
 // =====================================================
 
 function masterTick() {
   const now = Date.now();
 
-  // 1) Priming check — không cần client
+  // 1) Priming check
   if (!audioPrimed) {
     const targetBytes = Math.floor(
       AUDIO_BYTES_PER_MS * audioTargetBufferMs
@@ -766,7 +763,7 @@ function masterTick() {
     console.log("[SYNC] Playback started at", now);
   }
 
-  // 3) Audio emission — luôn chạy khi primed + epoch, discard nếu chưa ready
+  // 3) Audio emission
   if (audioPrimed && syncEpoch > 0) {
     const expected = Math.floor((now - syncEpoch) / AUDIO_INTERVAL);
     const gap = expected - audioFramesSinceSync;
@@ -788,7 +785,6 @@ function masterTick() {
         const frame = takeAudioFrame();
         audioFramesSinceSync++;
 
-        // Chỉ gửi client khi streamReady + có client + không bị block
         if (
           streamReady &&
           audioClient &&
@@ -818,7 +814,7 @@ function masterTick() {
     disconnectAudioClient(false);
   }
 
-  // 4) Video emission — luôn chạy khi primed + epoch, discard nếu chưa ready
+  // 4) Video emission
   if (videoPrimed && audioPrimed && syncEpoch > 0) {
     const expected = Math.floor((now - syncEpoch) / VIDEO_INTERVAL);
     const gap = expected - videoFramesSinceSync;
@@ -847,6 +843,21 @@ function masterTick() {
     if (now - syncEpoch >= STREAM_READY_GRACE_MS) {
       setStreamReady();
     }
+  }
+
+  // 5b) Cảnh báo nếu không có audio sau 5s
+  if (
+    streamReady &&
+    !firstAudioByteAt &&
+    !audioDetectWarned &&
+    ffmpegStartTime &&
+    now - ffmpegStartTime > 5000
+  ) {
+    audioDetectWarned = true;
+    console.log(
+      "[AUDIO] WARNING: no audio data after",
+      now - ffmpegStartTime, "ms — audio stream may be missing or probesize too small"
+    );
   }
 
   // 6) Drift safety
@@ -940,6 +951,8 @@ function startFFmpeg(channel) {
   ffmpegStartTime = Date.now();
   firstVideoByteAt = 0;
   firstAudioByteAt = 0;
+  audioDetected = false;
+  audioDetectWarned = false;
 
   console.log("\n==================================");
   console.log("CHANNEL:", channel.name);
@@ -964,10 +977,11 @@ function startFFmpeg(channel) {
 
   const args = [
     "-hide_banner",
-    "-loglevel", "error",
+    "-loglevel", "warning",
     "-nostdin",
-    "-probesize", "300000",
-    "-analyzeduration", "300000",
+    // Probesize đủ lớn để detect audio stream — KHÔNG giảm dưới 500000 cho IPTV
+    "-probesize", "1000000",
+    "-analyzeduration", "1000000",
     "-rw_timeout", "30000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
@@ -1035,7 +1049,17 @@ function startFFmpeg(channel) {
   child.stderr.on("data", data => {
     if (currentGeneration !== generation) return;
     const message = data.toString().trim();
-    if (message) console.log("[FFmpeg]", message);
+    if (!message) return;
+
+    if (message.includes("Audio:") || message.includes("Stream #0:1")) {
+      audioDetected = true;
+    }
+    if (message.includes("Stream map '0:a:0'") ||
+        message.includes("matches no streams")) {
+      console.log("[FFMPEG] WARNING: no audio stream found in source");
+    }
+
+    console.log("[FFmpeg]", message);
   });
 
   child.on("error", error => {
@@ -1104,7 +1128,7 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM — CHỜ STREAM READY RỒI MỚI TRẢ RESPONSE
+// VIDEO STREAM
 // =====================================================
 
 app.get("/stream", async (req, res) => {
@@ -1193,7 +1217,7 @@ app.get("/stream", async (req, res) => {
 });
 
 // =====================================================
-// AUDIO STREAM — CHỜ STREAM READY
+// AUDIO STREAM
 // =====================================================
 
 app.get("/audio", async (req, res) => {
@@ -1211,7 +1235,6 @@ app.get("/audio", async (req, res) => {
 
   console.log("[AUDIO] Client connected — streamReady=true");
 
-  // Disconnect client cũ (nếu có) nhưng GIỮ buffer + primed state
   disconnectAudioClient(false);
 
   audioClient = res;
@@ -1568,6 +1591,7 @@ app.get("/health", (req, res) => {
       ffmpegStartTime,
       firstVideoByteAt,
       firstAudioByteAt,
+      audioDetected,
       firstVideoByteLatencyMs: firstVideoByteAt ? firstVideoByteAt - ffmpegStartTime : null,
       firstAudioByteLatencyMs: firstAudioByteAt ? firstAudioByteAt - ffmpegStartTime : null,
       streamReadyLatencyMs: streamReadyAt && ffmpegStartTime ? streamReadyAt - ffmpegStartTime : null
