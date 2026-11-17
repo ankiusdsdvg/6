@@ -49,6 +49,9 @@ const AUDIO_BYTES_PER_SAMPLE = 2;
 const AUDIO_FRAME_MS = 200;
 const AUDIO_INTERVAL = AUDIO_FRAME_MS;
 
+// Audio tick RIÊNG (không dùng masterTick video) — chạy mỗi 50ms
+const AUDIO_TICK_MS = 50;
+
 const AUDIO_FRAME_BYTES =
   AUDIO_SAMPLE_RATE *
   AUDIO_CHANNELS *
@@ -60,13 +63,12 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Startup buffer — prime 1500ms để có đủ slack từ byte đầu tiên
-// (đây là điểm cân bằng: start chậm hơn ~500ms so với bản gốc,
-// nhưng mượt ngay từ đầu thay vì 30s sau mới mượt)
-const AUDIO_START_BUFFER_MS = 1500;
+// Prime 4s audio — trade-off: client chờ thêm ~2.5s so với bản gốc,
+// nhưng audio mượt từ frame đầu thay vì 15-20s sau
+const AUDIO_START_BUFFER_MS = 4000;
 
-// Buffer tối đa — tăng lên 3500ms để chống jitter 4G (Termux/3G/4G)
-const AUDIO_BUFFER_MS = 3500;
+// Buffer max 12s — đủ chứa burst từ -readrate 1.4 khi vượt TCP slow-start
+const AUDIO_BUFFER_MS = 12000;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -74,14 +76,17 @@ const AUDIO_BUFFER_MAX =
   AUDIO_BYTES_PER_SAMPLE *
   AUDIO_BUFFER_MS / 1000;
 
+// Prebuffer tối thiểu trước khi bắt đầu gửi cho client trong /audio
+const AUDIO_PREBUFFER_MS = 1500;
+
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
 const AUDIO_TARGET_MIN_MS = 800;
-const AUDIO_TARGET_MAX_MS = 2500;
+const AUDIO_TARGET_MAX_MS = 8000;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
-const DECODER_THREADS = 1;   // giảm từ 2 → 1 cho Termux (tránh context switch)
+const DECODER_THREADS = 1;
 const ENCODER_THREADS = 1;
 
 const WATCHDOG_INTERVAL = 5000;
@@ -95,16 +100,18 @@ const CLIENT_SKIP_THRESHOLD_MS = 300;
 const MAX_CLIENT_BLOCK_MS = 3000;
 const MAX_AUDIO_BLOCK_MS = 1500;
 
+// FFmpeg readrate: 1.4 = đọc nhanh hơn realtime 40% để vượt TCP slow-start.
+// Có thể override qua env: FFMPEG_READRATE=2.0
+const FFMPEG_READRATE = String(process.env.FFMPEG_READRATE || "1.4");
+
 // =====================================================
 // MASTER TIMER / VIDEO QUEUE / SYNC / STREAM READY
 // =====================================================
 
 const MASTER_TICK_MS = 10;
 
-// Video queue target 18 frames (~1.5s) để khớp audio start
 const VIDEO_QUEUE_TARGET = 18;
-// Video max 42 frames (~3.5s) khớp AUDIO_BUFFER_MS
-const VIDEO_QUEUE_MAX = 42;
+const VIDEO_QUEUE_MAX = 60;   // 5s max (trước 42) — đủ cho readrate 1.4
 
 const SYNC_TRIM_MS = 300;
 const MAX_SYNC_DRIFT_MS = 800;
@@ -162,6 +169,7 @@ let audioSilenceBytes = 0;
 let audioMaxObservedBytes = 0;
 
 let masterTimer = null;
+let audioTickTimer = null;
 
 let syncEpoch = 0;
 let audioFramesSinceSync = 0;
@@ -181,14 +189,12 @@ let lastVideoFrameTime = 0;
 let restarting = false;
 let manuallyStopped = true;
 
-// Startup diagnostics
 let ffmpegStartTime = 0;
 let firstVideoByteAt = 0;
 let firstAudioByteAt = 0;
 let audioDetected = false;
 let audioDetectWarned = false;
 
-// Runtime throughput monitoring (để biết FFmpeg có theo kịp realtime không)
 let audioBytesIn = 0;
 let videoFramesIn = 0;
 
@@ -538,6 +544,14 @@ function writeAudioFrame(frame, isSilence = false) {
     return false;
   }
 
+  // Force reset nếu blocked quá 1500ms — tránh câm kéo dài
+  if (audioBlocked && Date.now() - audioBlockedSince > MAX_AUDIO_BLOCK_MS) {
+    console.log("[AUDIO] Force reset blocked client after",
+      Date.now() - audioBlockedSince, "ms");
+    disconnectAudioClient(false);
+    return false;
+  }
+
   try {
     const ok = audioClient.write(frame);
 
@@ -547,24 +561,66 @@ function writeAudioFrame(frame, isSilence = false) {
       audioFramesSent++;
     }
 
-    if (!ok) {
+    if (!ok && !audioBlocked) {
       audioBlocked = true;
       audioBlockedSince = Date.now();
-
       audioClient.once("drain", () => {
         audioBlocked = false;
         audioBlockedSince = 0;
       });
-
-      return false;
     }
 
-    return true;
+    return ok;
   } catch (error) {
     console.error("[AUDIO WRITE]", error.message);
     disconnectAudioClient(false);
     return false;
   }
+}
+
+// =====================================================
+// AUDIO TICK — RIÊNG, KHÔNG PHỤ THUỘC MASTER TICK VIDEO
+// =====================================================
+
+function audioTick() {
+  if (!audioPrimed || syncEpoch === 0) return;
+
+  const now = Date.now();
+  const expected = Math.floor((now - syncEpoch) / AUDIO_INTERVAL);
+  let gap = expected - audioFramesSinceSync;
+
+  if (gap <= 0) return;
+
+  // Nếu gap quá lớn (event loop bị block) → skip để tránh burst quá lớn
+  if (gap > 20) {
+    const skip = gap - 20;
+    const skipBytes = Math.min(skip * AUDIO_FRAME_BYTES, audioBuffer.length) & ~1;
+    audioBuffer = audioBuffer.subarray(skipBytes);
+    audioFramesSinceSync += skip;
+    console.log("[AUDIO] Skip ahead", skip, "frames");
+    gap = 20;
+  }
+
+  for (let i = 0; i < gap; i++) {
+    const frame = takeAudioFrame();
+    audioFramesSinceSync++;
+
+    if (
+      streamReady &&
+      audioClient &&
+      !audioClient.destroyed &&
+      !audioClient.writableEnded
+    ) {
+      // Luôn ghi kể cả khi blocked — để TCP tự buffer, tránh câm kéo dài.
+      // Chỉ reset client nếu block > 1500ms (đã handle trong writeAudioFrame).
+      writeAudioFrame(frame, false);
+    }
+  }
+}
+
+function startAudioTimer() {
+  if (audioTickTimer) clearInterval(audioTickTimer);
+  audioTickTimer = setInterval(audioTick, AUDIO_TICK_MS);
 }
 
 // =====================================================
@@ -741,7 +797,8 @@ function processVideoData(chunk, currentGeneration) {
 }
 
 // =====================================================
-// MASTER TICK
+// MASTER TICK — CHỈ XỬ LÝ VIDEO + PRIMING + STREAM GATE
+// (audio đã tách sang audioTick riêng)
 // =====================================================
 
 function masterTick() {
@@ -771,56 +828,6 @@ function masterTick() {
     videoFramesSinceSync = 0;
     lastDriftCheck = now;
     console.log("[SYNC] Playback started at", now);
-  }
-
-  if (audioPrimed && syncEpoch > 0) {
-    const expected = Math.floor((now - syncEpoch) / AUDIO_INTERVAL);
-    const gap = expected - audioFramesSinceSync;
-
-    if (gap > 0) {
-      if (gap > 5) {
-        const skip = gap - 1;
-        const skipBytes = Math.min(
-          skip * AUDIO_FRAME_BYTES, audioBuffer.length
-        ) & ~1;
-        audioBuffer = audioBuffer.subarray(skipBytes);
-        audioFramesSinceSync += skip;
-        console.log("[AUDIO] Skip ahead", skip, "frames");
-      }
-
-      const emitCount = Math.min(gap, 2);
-
-      for (let i = 0; i < emitCount; i++) {
-        const frame = takeAudioFrame();
-        audioFramesSinceSync++;
-
-        if (
-          streamReady &&
-          audioClient &&
-          !audioClient.destroyed &&
-          !audioClient.writableEnded &&
-          !audioBlocked
-        ) {
-          writeAudioFrame(frame, false);
-        }
-      }
-    }
-  }
-
-  if (
-    audioClient &&
-    (audioClient.destroyed || audioClient.writableEnded)
-  ) {
-    disconnectAudioClient(false);
-  }
-
-  if (
-    audioClient &&
-    audioBlocked &&
-    Date.now() - audioBlockedSince > MAX_AUDIO_BLOCK_MS
-  ) {
-    console.log("[AUDIO] Slow client disconnected");
-    disconnectAudioClient(false);
   }
 
   if (videoPrimed && audioPrimed && syncEpoch > 0) {
@@ -967,12 +974,13 @@ function startFFmpeg(channel) {
   console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
   console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
   console.log("AUDIO BUFFER MAX:", AUDIO_BUFFER_MS, "ms");
+  console.log("AUDIO PREBUFFER:", AUDIO_PREBUFFER_MS, "ms");
+  console.log("AUDIO TICK:", AUDIO_TICK_MS, "ms");
   console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
   console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
   console.log("STREAM READY GRACE:", STREAM_READY_GRACE_MS, "ms");
-  console.log("MASTER TICK:", MASTER_TICK_MS, "ms");
-  console.log("DECODER THREADS:", DECODER_THREADS);
-  console.log("MODE: EPOCH-BASED + BIG BUFFER FOR JITTERY NETWORKS");
+  console.log("FFMPEG READRATE:", FFMPEG_READRATE);
+  console.log("MODE: SPLIT AUDIO/VIDEO TICK + READRATE > 1");
   console.log("==================================");
 
   const videoFilter = [
@@ -981,21 +989,27 @@ function startFFmpeg(channel) {
     "setsar=1"
   ].join(",");
 
+  // Audio filter đơn giản: async=1 = compensate ngay khi lệch > 1ms
+  // (thay cho async=75:min_hard_comp=0.200 — gây chậm 15-20s khi lock)
+  const audioFilter =
+    `aresample=${AUDIO_SAMPLE_RATE}:async=1:first_pts=0`;
+
   const args = [
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
-    // Probesize 800K — vẫn đủ detect audio cho IPTV (không mất tiếng),
-    // nhưng nhanh hơn 1M ~20%
-    "-probesize", "800000",
-    "-analyzeduration", "800000",
-    "-rw_timeout", "15000000",       // 15s thay vì 30s — fail nhanh hơn khi mạng chết
+    "-probesize", "1000000",
+    "-analyzeduration", "1000000",
+    "-rw_timeout", "15000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    "-re",                            // giữ -re: đọc đúng realtime, tránh tràn pipe
-    "-fflags", "+discardcorrupt+genpts",
+    // readrate > 1 để vượt TCP slow-start trên 4G trong 15-20s đầu
+    "-readrate", FFMPEG_READRATE,
+    "-use_wallclock_as_timestamps", "1",
+    "-fflags", "+discardcorrupt+genpts+igndts",
+    "-avoid_negative_ts", "make_zero",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
     "-i", channel.url,
@@ -1012,8 +1026,7 @@ function startFFmpeg(channel) {
     "pipe:1",
     "-map", "0:a:0?",
     "-vn",
-    "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=75:min_hard_comp=0.200:first_pts=0`,
+    "-af", audioFilter,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
@@ -1224,7 +1237,7 @@ app.get("/stream", async (req, res) => {
 });
 
 // =====================================================
-// AUDIO STREAM
+// AUDIO STREAM — PREBUFFER TRƯỚC KHI GỬI
 // =====================================================
 
 app.get("/audio", async (req, res) => {
@@ -1239,6 +1252,22 @@ app.get("/audio", async (req, res) => {
       error: "Stream not ready — try again"
     });
   }
+
+  // Chờ thêm cho đến khi buffer đủ AUDIO_PREBUFFER_MS trước khi gửi
+  // (đảm bảo client có continuous stream từ byte đầu)
+  const prebufferTarget = Math.floor(AUDIO_BYTES_PER_MS * AUDIO_PREBUFFER_MS);
+  const waitStart = Date.now();
+
+  while (
+    audioBuffer.length < prebufferTarget &&
+    Date.now() - waitStart < 5000 &&
+    streamReady
+  ) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  console.log("[AUDIO] Buffer at accept:", audioBuffer.length,
+    "bytes / target:", prebufferTarget);
 
   console.log("[AUDIO] Client connected — streamReady=true");
 
@@ -1572,7 +1601,6 @@ app.get("/health", (req, res) => {
   const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
   const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
 
-  // Tính toán FFmpeg có theo kịp realtime không
   const elapsedSec = ffmpegStartTime ? (now - ffmpegStartTime) / 1000 : 0;
   const audioInKbPerSec = elapsedSec > 0 ? (audioBytesIn / 1024 / elapsedSec) : 0;
   const expectedAudioKbPerSec = (AUDIO_BYTES_PER_MS * 1000) / 1024;
@@ -1590,7 +1618,8 @@ app.get("/health", (req, res) => {
     ffmpegRunning: !!ffmpeg,
     restarting,
     manuallyStopped,
-    pipeline: "EPOCH_WALLCLOCK_MJPEG_PCM_GATED",
+    pipeline: "SPLIT_TICK_EPOCH_MJPEG_PCM",
+    ffmpegReadrate: FFMPEG_READRATE,
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1623,7 +1652,7 @@ app.get("/health", (req, res) => {
       audioProductionRate,
       videoInFps: Number(videoInFps.toFixed(2)),
       videoProductionRate,
-      note: "<100% nghĩa là mạng 4G không đủ băng thông → giảm chất lượng"
+      note: "<100% nghĩa là mạng chậm hơn FFmpeg cần → giảm chất lượng hoặc tăng FFMPEG_READRATE"
     },
 
     videoPrimed,
@@ -1661,10 +1690,12 @@ app.get("/health", (req, res) => {
     audioChannels: AUDIO_CHANNELS,
     audioFrameBytes: AUDIO_FRAME_BYTES,
     audioInterval: AUDIO_INTERVAL,
+    audioTickMs: AUDIO_TICK_MS,
     audioBufferBytes: audioBuffer.length,
     audioBufferMax: AUDIO_BUFFER_MAX,
     audioBufferMs: Math.round(audioBufMs),
     audioStartBufferMs: AUDIO_START_BUFFER_MS,
+    audioPrebufferMs: AUDIO_PREBUFFER_MS,
     audioTargetBufferMs,
     audioPrimed,
     audioMaxObservedBytes,
@@ -1697,13 +1728,12 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - EPOCH SYNC + STREAM GATE\n" +
+    "IPTV SERVER RUNNING - SPLIT TICK + READRATE + PREBUFFER\n" +
     "Usage:\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
-    "  /audio               → PCM audio\n" +
-    "\nStream/audio endpoints HOLD until buffer is stable.\n" +
-    "Client receives smooth content from the very first byte."
+    "  /audio               → PCM audio (prebuffered)\n" +
+    "\nAudio pipeline tách riêng khỏi video tick để đảm bảo mượt từ đầu."
   );
 });
 
@@ -1719,6 +1749,7 @@ async function main() {
   }
 
   startMasterTimer();
+  startAudioTimer();
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log("--------------------------------");
@@ -1727,12 +1758,14 @@ async function main() {
     console.log("CHANNELS:", channels.length);
     console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
     console.log("MASTER TICK:", MASTER_TICK_MS, "ms");
+    console.log("AUDIO TICK:", AUDIO_TICK_MS, "ms");
     console.log("VIDEO QUEUE TARGET:", VIDEO_QUEUE_TARGET, "frames");
     console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
     console.log("AUDIO START BUFFER:", AUDIO_START_BUFFER_MS, "ms");
     console.log("AUDIO BUFFER MAX:", AUDIO_BUFFER_MS, "ms");
-    console.log("STREAM READY GRACE:", STREAM_READY_GRACE_MS, "ms");
-    console.log("PIPELINE: EPOCH + STREAM GATE");
+    console.log("AUDIO PREBUFFER:", AUDIO_PREBUFFER_MS, "ms");
+    console.log("FFMPEG READRATE:", FFMPEG_READRATE);
+    console.log("PIPELINE: SPLIT TICK + READRATE");
     console.log("--------------------------------");
   });
 
