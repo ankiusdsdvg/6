@@ -60,11 +60,13 @@ const AUDIO_BYTES_PER_MS =
   AUDIO_CHANNELS *
   AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Buffer khởi động — dùng để xác định audioPrimed
-const AUDIO_START_BUFFER_MS = 1000;
+// Startup buffer — prime 1500ms để có đủ slack từ byte đầu tiên
+// (đây là điểm cân bằng: start chậm hơn ~500ms so với bản gốc,
+// nhưng mượt ngay từ đầu thay vì 30s sau mới mượt)
+const AUDIO_START_BUFFER_MS = 1500;
 
-// Buffer tối đa — khớp với VIDEO_QUEUE_MAX (2s) để A/V cân
-const AUDIO_BUFFER_MS = 2000;
+// Buffer tối đa — tăng lên 3500ms để chống jitter 4G (Termux/3G/4G)
+const AUDIO_BUFFER_MS = 3500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
@@ -75,11 +77,11 @@ const AUDIO_BUFFER_MAX =
 let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
 let audioStableFrames = 0;
 
-const AUDIO_TARGET_MIN_MS = 500;
-const AUDIO_TARGET_MAX_MS = 1400;
+const AUDIO_TARGET_MIN_MS = 800;
+const AUDIO_TARGET_MAX_MS = 2500;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
-const DECODER_THREADS = 2;
+const DECODER_THREADS = 1;   // giảm từ 2 → 1 cho Termux (tránh context switch)
 const ENCODER_THREADS = 1;
 
 const WATCHDOG_INTERVAL = 5000;
@@ -99,15 +101,16 @@ const MAX_AUDIO_BLOCK_MS = 1500;
 
 const MASTER_TICK_MS = 10;
 
-const VIDEO_QUEUE_TARGET = 12;
-const VIDEO_QUEUE_MAX = 24;   // 2s — khớp AUDIO_BUFFER_MS
+// Video queue target 18 frames (~1.5s) để khớp audio start
+const VIDEO_QUEUE_TARGET = 18;
+// Video max 42 frames (~3.5s) khớp AUDIO_BUFFER_MS
+const VIDEO_QUEUE_MAX = 42;
 
 const SYNC_TRIM_MS = 300;
 const MAX_SYNC_DRIFT_MS = 800;
 
-// Streaming gate — chỉ mở khi đã "ổn định"
-const STREAM_READY_GRACE_MS = 500;    // chờ thêm 500ms sau syncEpoch
-const STREAM_READY_TIMEOUT_MS = 25000; // tối đa 25s cho client chờ
+const STREAM_READY_GRACE_MS = 500;
+const STREAM_READY_TIMEOUT_MS = 25000;
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
@@ -165,7 +168,6 @@ let audioFramesSinceSync = 0;
 let videoFramesSinceSync = 0;
 let lastDriftCheck = 0;
 
-// Streaming gate
 let streamReady = false;
 let streamReadyAt = 0;
 const streamReadyWaiters = [];
@@ -179,6 +181,17 @@ let lastVideoFrameTime = 0;
 let restarting = false;
 let manuallyStopped = true;
 
+// Startup diagnostics
+let ffmpegStartTime = 0;
+let firstVideoByteAt = 0;
+let firstAudioByteAt = 0;
+let audioDetected = false;
+let audioDetectWarned = false;
+
+// Runtime throughput monitoring (để biết FFmpeg có theo kịp realtime không)
+let audioBytesIn = 0;
+let videoFramesIn = 0;
+
 // =====================================================
 // STREAM READY — GATE
 // =====================================================
@@ -189,7 +202,8 @@ function setStreamReady() {
   streamReady = true;
   streamReadyAt = Date.now();
 
-  console.log("[STREAM] READY — streaming enabled");
+  const totalWait = ffmpegStartTime ? streamReadyAt - ffmpegStartTime : 0;
+  console.log("[STREAM] READY — streaming enabled (total wait:", totalWait, "ms)");
 
   const waiters = streamReadyWaiters.splice(0);
 
@@ -414,6 +428,8 @@ function resetAudioState(resetStats = false) {
     audioFramesSent = 0;
     audioSilenceSent = 0;
     audioSilenceBytes = 0;
+    audioBytesIn = 0;
+    videoFramesIn = 0;
   }
 }
 
@@ -423,8 +439,6 @@ function clearAudioBuffer() {
   audioStableFrames = 0;
 }
 
-// clearBuffer = false: giữ buffer + primed state (dùng khi client reconnect
-// hoặc khi /audio accept sau streamReady)
 function disconnectAudioClient(clearBuffer = true) {
   const old = audioClient;
 
@@ -443,6 +457,8 @@ function disconnectAudioClient(clearBuffer = true) {
 
 function pushAudioBuffer(chunk) {
   if (!chunk?.length) return;
+
+  audioBytesIn += chunk.length;
 
   if (chunk.length & 1) {
     chunk = chunk.subarray(0, chunk.length - 1);
@@ -702,8 +718,8 @@ function processVideoData(chunk, currentGeneration) {
     const frame = Buffer.from(jpegPending.subarray(0, frameLength));
 
     lastVideoFrameReceived = Date.now();
+    videoFramesIn++;
 
-    // Sync trim
     if (videoPrimed && audioPrimed) {
       const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
       const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
@@ -725,13 +741,12 @@ function processVideoData(chunk, currentGeneration) {
 }
 
 // =====================================================
-// MASTER TICK — AUDIO + VIDEO EMISSION DUY NHẤT
+// MASTER TICK
 // =====================================================
 
 function masterTick() {
   const now = Date.now();
 
-  // 1) Priming check — không cần client
   if (!audioPrimed) {
     const targetBytes = Math.floor(
       AUDIO_BYTES_PER_MS * audioTargetBufferMs
@@ -750,7 +765,6 @@ function masterTick() {
     console.log("[VIDEO] Primed:", videoQueue.length, "frames");
   }
 
-  // 2) Sync epoch
   if (audioPrimed && videoPrimed && syncEpoch === 0) {
     syncEpoch = now;
     audioFramesSinceSync = 0;
@@ -759,7 +773,6 @@ function masterTick() {
     console.log("[SYNC] Playback started at", now);
   }
 
-  // 3) Audio emission — luôn chạy khi primed + epoch, discard nếu chưa ready
   if (audioPrimed && syncEpoch > 0) {
     const expected = Math.floor((now - syncEpoch) / AUDIO_INTERVAL);
     const gap = expected - audioFramesSinceSync;
@@ -781,7 +794,6 @@ function masterTick() {
         const frame = takeAudioFrame();
         audioFramesSinceSync++;
 
-        // Chỉ gửi client khi streamReady + có client + không bị block
         if (
           streamReady &&
           audioClient &&
@@ -811,7 +823,6 @@ function masterTick() {
     disconnectAudioClient(false);
   }
 
-  // 4) Video emission — luôn chạy khi primed + epoch, discard nếu chưa ready
   if (videoPrimed && audioPrimed && syncEpoch > 0) {
     const expected = Math.floor((now - syncEpoch) / VIDEO_INTERVAL);
     const gap = expected - videoFramesSinceSync;
@@ -835,14 +846,26 @@ function masterTick() {
     }
   }
 
-  // 5) StreamReady gate
   if (!streamReady && audioPrimed && videoPrimed && syncEpoch > 0) {
     if (now - syncEpoch >= STREAM_READY_GRACE_MS) {
       setStreamReady();
     }
   }
 
-  // 6) Drift safety
+  if (
+    streamReady &&
+    !firstAudioByteAt &&
+    !audioDetectWarned &&
+    ffmpegStartTime &&
+    now - ffmpegStartTime > 5000
+  ) {
+    audioDetectWarned = true;
+    console.log(
+      "[AUDIO] WARNING: no audio data after",
+      now - ffmpegStartTime, "ms — audio stream may be missing or probesize too small"
+    );
+  }
+
   checkDrift();
 }
 
@@ -930,6 +953,12 @@ function startFFmpeg(channel) {
   lastVideoFrameReceived = Date.now();
   lastVideoFrameTime = Date.now();
 
+  ffmpegStartTime = Date.now();
+  firstVideoByteAt = 0;
+  firstAudioByteAt = 0;
+  audioDetected = false;
+  audioDetectWarned = false;
+
   console.log("\n==================================");
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
@@ -942,7 +971,8 @@ function startFFmpeg(channel) {
   console.log("VIDEO QUEUE MAX:", VIDEO_QUEUE_MAX, "frames");
   console.log("STREAM READY GRACE:", STREAM_READY_GRACE_MS, "ms");
   console.log("MASTER TICK:", MASTER_TICK_MS, "ms");
-  console.log("MODE: EPOCH-BASED + STREAM GATE");
+  console.log("DECODER THREADS:", DECODER_THREADS);
+  console.log("MODE: EPOCH-BASED + BIG BUFFER FOR JITTERY NETWORKS");
   console.log("==================================");
 
   const videoFilter = [
@@ -955,14 +985,16 @@ function startFFmpeg(channel) {
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
-    "-probesize", "1000000",
-    "-analyzeduration", "1000000",
-    "-rw_timeout", "30000000",
+    // Probesize 800K — vẫn đủ detect audio cho IPTV (không mất tiếng),
+    // nhưng nhanh hơn 1M ~20%
+    "-probesize", "800000",
+    "-analyzeduration", "800000",
+    "-rw_timeout", "15000000",       // 15s thay vì 30s — fail nhanh hơn khi mạng chết
     "-reconnect", "1",
     "-reconnect_streamed", "1",
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
-    "-re",
+    "-re",                            // giữ -re: đọc đúng realtime, tránh tràn pipe
     "-fflags", "+discardcorrupt+genpts",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
@@ -981,7 +1013,7 @@ function startFFmpeg(channel) {
     "-map", "0:a:0?",
     "-vn",
     "-af",
-    `aresample=${AUDIO_SAMPLE_RATE}:async=100:min_hard_comp=0.500:first_pts=0`,
+    `aresample=${AUDIO_SAMPLE_RATE}:async=75:min_hard_comp=0.200:first_pts=0`,
     "-ac", String(AUDIO_CHANNELS),
     "-ar", String(AUDIO_SAMPLE_RATE),
     "-c:a", "pcm_s16le",
@@ -997,11 +1029,19 @@ function startFFmpeg(channel) {
   ffmpeg = child;
 
   child.stdout.on("data", chunk => {
+    if (!firstVideoByteAt && chunk?.length) {
+      firstVideoByteAt = Date.now();
+      console.log("[START] First video byte:", firstVideoByteAt - ffmpegStartTime, "ms");
+    }
     processVideoData(chunk, currentGeneration);
   });
 
   if (child.stdio[3]) {
     child.stdio[3].on("data", chunk => {
+      if (!firstAudioByteAt && chunk?.length) {
+        firstAudioByteAt = Date.now();
+        console.log("[START] First audio byte:", firstAudioByteAt - ffmpegStartTime, "ms");
+      }
       if (currentGeneration === generation) {
         pushAudioBuffer(chunk);
       }
@@ -1016,7 +1056,17 @@ function startFFmpeg(channel) {
   child.stderr.on("data", data => {
     if (currentGeneration !== generation) return;
     const message = data.toString().trim();
-    if (message) console.log("[FFmpeg]", message);
+    if (!message) return;
+
+    if (message.includes("Audio:") || message.includes("Stream #0:1")) {
+      audioDetected = true;
+    }
+    if (message.includes("Stream map '0:a:0'") ||
+        message.includes("matches no streams")) {
+      console.log("[FFMPEG] WARNING: no audio stream found in source");
+    }
+
+    console.log("[FFmpeg]", message);
   });
 
   child.on("error", error => {
@@ -1085,7 +1135,7 @@ function scheduleRestart() {
 }
 
 // =====================================================
-// VIDEO STREAM — CHỜ STREAM READY RỒI MỚI TRẢ RESPONSE
+// VIDEO STREAM
 // =====================================================
 
 app.get("/stream", async (req, res) => {
@@ -1174,7 +1224,7 @@ app.get("/stream", async (req, res) => {
 });
 
 // =====================================================
-// AUDIO STREAM — CHỜ STREAM READY
+// AUDIO STREAM
 // =====================================================
 
 app.get("/audio", async (req, res) => {
@@ -1192,7 +1242,6 @@ app.get("/audio", async (req, res) => {
 
   console.log("[AUDIO] Client connected — streamReady=true");
 
-  // Disconnect client cũ (nếu có) nhưng GIỮ buffer + primed state
   disconnectAudioClient(false);
 
   audioClient = res;
@@ -1523,6 +1572,17 @@ app.get("/health", (req, res) => {
   const videoBufMs = videoQueue.length * VIDEO_INTERVAL;
   const audioBufMs = audioBuffer.length / AUDIO_BYTES_PER_MS;
 
+  // Tính toán FFmpeg có theo kịp realtime không
+  const elapsedSec = ffmpegStartTime ? (now - ffmpegStartTime) / 1000 : 0;
+  const audioInKbPerSec = elapsedSec > 0 ? (audioBytesIn / 1024 / elapsedSec) : 0;
+  const expectedAudioKbPerSec = (AUDIO_BYTES_PER_MS * 1000) / 1024;
+  const audioProductionRate = expectedAudioKbPerSec > 0
+    ? Math.round(audioInKbPerSec / expectedAudioKbPerSec * 100) : 0;
+
+  const videoInFps = elapsedSec > 0 ? videoFramesIn / elapsedSec : 0;
+  const videoProductionRate = VIDEO_FPS > 0
+    ? Math.round(videoInFps / VIDEO_FPS * 100) : 0;
+
   res.json({
     status: "running",
     channelCount: channels.length,
@@ -1544,6 +1604,27 @@ app.get("/health", (req, res) => {
     streamReadyAgeMs: streamReadyAt ? now - streamReadyAt : null,
     streamReadyGraceMs: STREAM_READY_GRACE_MS,
     streamReadyWaiters: streamReadyWaiters.length,
+
+    startupTiming: {
+      ffmpegStartTime,
+      firstVideoByteAt,
+      firstAudioByteAt,
+      audioDetected,
+      firstVideoByteLatencyMs: firstVideoByteAt ? firstVideoByteAt - ffmpegStartTime : null,
+      firstAudioByteLatencyMs: firstAudioByteAt ? firstAudioByteAt - ffmpegStartTime : null,
+      streamReadyLatencyMs: streamReadyAt && ffmpegStartTime ? streamReadyAt - ffmpegStartTime : null
+    },
+
+    productionRate: {
+      audioBytesIn,
+      videoFramesIn,
+      audioKbPerSec: Number(audioInKbPerSec.toFixed(2)),
+      expectedAudioKbPerSec: Number(expectedAudioKbPerSec.toFixed(2)),
+      audioProductionRate,
+      videoInFps: Number(videoInFps.toFixed(2)),
+      videoProductionRate,
+      note: "<100% nghĩa là mạng 4G không đủ băng thông → giảm chất lượng"
+    },
 
     videoPrimed,
     videoQueueLength: videoQueue.length,
