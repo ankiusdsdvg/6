@@ -25,7 +25,6 @@ const JPEG_QUALITY = 10;
 const JPEG_QUALITY_720P = 15;
 const JPEG_QUALITY_540P = 20;
 const JPEG_QUALITY_340P = 25;
-const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
 const QUALITY_PRESETS = Object.freeze([
   Object.freeze({ id: "1080p", label: "1080p", jpegQuality: JPEG_QUALITY }),
@@ -36,54 +35,32 @@ const QUALITY_PRESETS = Object.freeze([
 
 let currentQualityId = "1080p";
 
-// =====================================================
-// AUDIO CONFIG — ĐÃ SỬA BUG
-// =====================================================
-
+// ===== AUDIO =====
+// Chỉ dùng để mô tả; FFmpeg tự resample bằng -ar/-ac
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
-const AUDIO_FRAME_MS = 200;
-const AUDIO_INTERVAL = AUDIO_FRAME_MS;
-const AUDIO_FRAME_BYTES =
-  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
-  AUDIO_BYTES_PER_SAMPLE * AUDIO_FRAME_MS / 1000;
 
-const AUDIO_START_BUFFER_MS = 800;
-const AUDIO_TARGET_MIN_MS = 700;
-const AUDIO_TARGET_MAX_MS = 1400;
+// Prebuffer 300ms trước khi bắt đầu ghi (đủ để tránh chớp đầu tiên)
+const AUDIO_PREBUFFER_BYTES =
+  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE * 0.3;
 
-// 🔥 FIX: Buffer capacity phải >= target max + margin an toàn.
-// Trước đây AUDIO_BUFFER_MS = 800 < AUDIO_TARGET_MAX_MS (1400) → buffer luôn bị cap
-// → FFmpeg output bị drop liên tục → mỗi frame thiếu cuối → tiếng giật.
-const AUDIO_BUFFER_MS = AUDIO_TARGET_MAX_MS + 600; // 2000ms
-const AUDIO_BUFFER_MAX =
-  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS *
-  AUDIO_BYTES_PER_SAMPLE * AUDIO_BUFFER_MS / 1000;
-
-// Chẩn đoán starvation: nếu nguồn chưa có audio track trong >5s
-const AUDIO_STARVATION_WARN_MS = 5000;
-
-let audioTargetBufferMs = AUDIO_START_BUFFER_MS;
-let audioStableFrames = 0;
-
-const AUDIO_STABLE_FRAMES_TO_REDUCE = 150;
+// Nếu nguồn burst quá lớn (lỗi hiếm), flush luôn để không tràn RAM
+const AUDIO_PREBUFFER_MAX_BYTES =
+  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE * 5;
 
 const DECODER_THREADS = 2;
 const ENCODER_THREADS = 1;
-const AUDIO_THREADS = 1;
 
 const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
-const AUDIO_RESTART_DELAY = 3000;
 
 const MAX_VIDEO_BUFFER = 512 * 1024;
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 
 const CLIENT_SKIP_THRESHOLD_MS = 30;
 const MAX_CLIENT_BLOCK_MS = 3000;
-const MAX_AUDIO_BLOCK_MS = 1500;
 
 const JPEG_SOI = Buffer.from([0xff, 0xd8]);
 const JPEG_EOI = Buffer.from([0xff, 0xd9]);
@@ -102,39 +79,31 @@ const BANDWIDTH_LIMIT_GB = Number(process.env.BANDWIDTH_LIMIT_GB || 5);
 let channels = [];
 let currentChannel = null;
 let ffmpeg = null;
-let audioFFmpeg = null;
-let audioRestartTimer = null;
 let generation = 0;
 
 let latestFrame = null;
 let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
-let videoDroppedFrames = 0;
 let videoInvalidFrames = 0;
 let videoSentFrames = 0;
 let videoClients = 0;
-
 const videoClientsMap = new Map();
 
-let audioBuffer = Buffer.alloc(0);
+// ===== AUDIO STATE (simple passthrough) =====
 let audioClient = null;
-let audioTimer = null;
-let audioBlocked = false;
-let audioBlockedSince = 0;
-let audioUnderflows = 0;
-let audioOverflowBytes = 0;
-let audioFramesSent = 0;
-let audioSilenceSent = 0;
-let audioPrimed = false;
-let audioSilenceBytes = 0;
-let audioLastTick = 0;
-let audioMaxObservedBytes = 0;
+let audioClientSlow = false;
+let audioPrebuffer = [];        // mảng Buffer, không concat
+let audioPrebufferBytes = 0;
+let audioStarted = false;
 
-// Chẩn đoán
-let audioFirstDataAt = 0;      // timestamp lần đầu có data thật từ FFmpeg
-let audioStarvingSince = 0;    // timestamp bắt đầu "khát" audio
-let audioStarvingWarned = false;
+// Diagnostics
+let audioBytesReceived = 0;
+let audioBytesSent = 0;
+let audioBytesDropped = 0;
+let audioFirstByteAt = 0;
+let audioLastByteAt = 0;
+let audioStarvingLogged = false;
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -143,7 +112,7 @@ let restarting = false;
 let manuallyStopped = true;
 
 // =====================================================
-// PLAYLIST (giữ nguyên)
+// PLAYLIST
 // =====================================================
 
 function parseResolutionFromName(name) {
@@ -192,11 +161,11 @@ function normalizeQualityId(value) {
   const raw = String(value || "").trim().toLowerCase().replace(/\s+/g, "");
   if (!raw) return null;
   const normalized = raw.endsWith("p") ? raw : `${raw}p`;
-  return QUALITY_PRESETS.some(preset => preset.id === normalized) ? normalized : null;
+  return QUALITY_PRESETS.some(p => p.id === normalized) ? normalized : null;
 }
 
 function getCurrentQualityPreset() {
-  return QUALITY_PRESETS.find(preset => preset.id === currentQualityId) || QUALITY_PRESETS[0];
+  return QUALITY_PRESETS.find(p => p.id === currentQualityId) || QUALITY_PRESETS[0];
 }
 
 function qualityResponse() {
@@ -204,20 +173,18 @@ function qualityResponse() {
   return {
     quality: preset.id,
     jpegQuality: preset.jpegQuality,
-    presets: QUALITY_PRESETS.map(item => ({
-      id: item.id, label: item.label, jpegQuality: item.jpegQuality
+    presets: QUALITY_PRESETS.map(i => ({
+      id: i.id, label: i.label, jpegQuality: i.jpegQuality
     }))
   };
 }
 
 function setQuality(value) {
-  const qualityId = normalizeQualityId(value);
-  if (!qualityId) return null;
-  const changed = qualityId !== currentQualityId;
-  currentQualityId = qualityId;
-  if (changed && currentChannel && !manuallyStopped) {
-    startFFmpeg(currentChannel);
-  }
+  const id = normalizeQualityId(value);
+  if (!id) return null;
+  const changed = id !== currentQualityId;
+  currentQualityId = id;
+  if (changed && currentChannel && !manuallyStopped) startFFmpeg(currentChannel);
   return getCurrentQualityPreset();
 }
 
@@ -245,240 +212,101 @@ async function loadChannels() {
 }
 
 // =====================================================
-// AUDIO BUFFER / CLOCK
+// AUDIO — SIMPLE PASSTHROUGH
 // =====================================================
 
-function resetAudioState(resetStats = false) {
-  audioBuffer = Buffer.alloc(0);
-  audioPrimed = false;
-  audioStableFrames = 0;
-  audioTargetBufferMs = AUDIO_START_BUFFER_MS;
-  audioLastTick = 0;
-  audioMaxObservedBytes = 0;
-  audioFirstDataAt = 0;
-  audioStarvingSince = 0;
-  audioStarvingWarned = false;
-
-  if (resetStats) {
-    audioUnderflows = 0;
-    audioOverflowBytes = 0;
-    audioFramesSent = 0;
-    audioSilenceSent = 0;
-    audioSilenceBytes = 0;
-  }
-}
-
-function clearAudioBuffer() {
-  audioBuffer = Buffer.alloc(0);
-  audioPrimed = false;
-}
-
 function disconnectAudioClient() {
-  if (audioTimer) { clearTimeout(audioTimer); audioTimer = null; }
   const old = audioClient;
   audioClient = null;
-  audioBlocked = false;
-  audioBlockedSince = 0;
-  clearAudioBuffer();
+  audioClientSlow = false;
+  audioStarted = false;
+  audioPrebuffer = [];
+  audioPrebufferBytes = 0;
   if (old && !old.destroyed) {
     try { old.destroy(); } catch (_) {}
   }
 }
 
-function pushAudioBuffer(chunk) {
-  if (!audioClient || audioClient.destroyed || audioClient.writableEnded || !chunk?.length) {
-    return;
-  }
+// 🔥 HÀM CỰC NHANH — không Buffer.concat, không alloc, không pause FFmpeg.
+// Nếu client chậm → drop để không bao giờ block FFmpeg (giữ video mượt).
+function handleAudioChunk(chunk) {
+  if (!chunk || !chunk.length) return;
+
+  // Align theo sample 16-bit
   if (chunk.length & 1) chunk = chunk.subarray(0, chunk.length - 1);
   if (!chunk.length) return;
 
-  // Đánh dấu lần đầu có data thật
-  if (!audioFirstDataAt) {
-    audioFirstDataAt = Date.now();
-    const waited = audioStarvingSince ? (audioFirstDataAt - audioStarvingSince) / 1000 : 0;
-    console.log(`[AUDIO] First real audio data arrived` +
-      (waited > 0 ? ` after ${waited.toFixed(1)}s of source starvation` : ""));
-    audioStarvingSince = 0;
-    audioStarvingWarned = false;
-  }
-
-  const total = audioBuffer.length + chunk.length;
-
-  if (total > AUDIO_BUFFER_MAX) {
-    const excess = total - AUDIO_BUFFER_MAX;
-    const drop = excess + (excess & 1);
-    audioOverflowBytes += drop;
-    if (drop >= audioBuffer.length) {
-      const fromChunk = Math.min(chunk.length, AUDIO_BUFFER_MAX);
-      audioBuffer = Buffer.from(chunk.subarray(chunk.length - fromChunk));
-    } else {
-      const keepOld = audioBuffer.subarray(drop);
-      audioBuffer = Buffer.concat([keepOld, chunk]);
-    }
-  } else {
-    audioBuffer = audioBuffer.length
-      ? Buffer.concat([audioBuffer, chunk], total)
-      : Buffer.from(chunk);
-  }
-
-  if (audioBuffer.length > AUDIO_BUFFER_MAX) {
-    audioBuffer = Buffer.from(audioBuffer.subarray(-AUDIO_BUFFER_MAX));
-  }
-  if (audioBuffer.length & 1) {
-    audioBuffer = Buffer.from(audioBuffer.subarray(1));
-  }
-  if (audioBuffer.length > audioMaxObservedBytes) {
-    audioMaxObservedBytes = audioBuffer.length;
-  }
-}
-
-function makeSilenceFrame() {
-  return Buffer.alloc(AUDIO_FRAME_BYTES, 0);
-}
-
-function takeAudioFrame() {
-  const frame = Buffer.alloc(AUDIO_FRAME_BYTES, 0);
-  const count = Math.min(audioBuffer.length, AUDIO_FRAME_BYTES) & ~1;
-
-  if (count > 0) {
-    audioBuffer.copy(frame, 0, 0, count);
-    audioBuffer = audioBuffer.subarray(count);
-  }
-
-  if (count < AUDIO_FRAME_BYTES) {
-    audioUnderflows++;
-    audioSilenceBytes += AUDIO_FRAME_BYTES - count;
-    audioStableFrames = 0;
-    audioTargetBufferMs = Math.min(AUDIO_TARGET_MAX_MS, audioTargetBufferMs + 100);
-
-    // Log chẩn đoán: chỉ log mỗi 20 underflow để tránh spam
-    if (audioUnderflows % 20 === 1) {
-      console.log(
-        `[AUDIO] Underflow #${audioUnderflows}` +
-        ` | have=${count}/${AUDIO_FRAME_BYTES}` +
-        ` | buffer=${audioBuffer.length}B` +
-        ` (${((audioBuffer.length / AUDIO_BUFFER_MAX) * 100).toFixed(1)}%)` +
-        ` | target=${audioTargetBufferMs}ms` +
-        ` | overflowTotal=${audioOverflowBytes}B`
-      );
-    }
-  } else {
-    audioStableFrames++;
-    if (audioStableFrames >= AUDIO_STABLE_FRAMES_TO_REDUCE) {
-      audioTargetBufferMs = Math.max(AUDIO_TARGET_MIN_MS, audioTargetBufferMs - 50);
-      audioStableFrames = 0;
-    }
-  }
-
-  return frame;
-}
-
-function writeAudioFrame(frame, isSilence = false) {
-  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
-    disconnectAudioClient();
-    return false;
-  }
-  try {
-    const ok = audioClient.write(frame);
-    if (isSilence) audioSilenceSent++;
-    else audioFramesSent++;
-
-    if (!ok) {
-      audioBlocked = true;
-      audioBlockedSince = Date.now();
-      audioClient.once("drain", () => {
-        audioBlocked = false;
-        audioBlockedSince = 0;
-      });
-      return false;
-    }
-    return true;
-  } catch (error) {
-    console.error("[AUDIO WRITE]", error.message);
-    disconnectAudioClient();
-    return false;
-  }
-}
-
-function audioTick() {
-  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
-    disconnectAudioClient();
-    return;
-  }
-
-  if (audioBlocked) {
-    if (Date.now() - audioBlockedSince > MAX_AUDIO_BLOCK_MS) {
-      console.log("[AUDIO] Slow client disconnected");
-      disconnectAudioClient();
-    }
-    return;
-  }
-
   const now = Date.now();
-  const elapsed = audioLastTick ? now - audioLastTick : AUDIO_INTERVAL;
-  audioLastTick = now;
+  if (!audioFirstByteAt) {
+    audioFirstByteAt = now;
+    console.log("[AUDIO] First byte from source arrived");
+  }
+  audioLastByteAt = now;
+  audioBytesReceived += chunk.length;
 
-  if (elapsed > AUDIO_INTERVAL * 3) {
-    console.warn("[AUDIO] Sender clock delayed:", elapsed, "ms");
+  // Không có client → drop (nhưng vẫn giữ firstByteAt để log biết nguồn có audio)
+  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
+    return;
   }
 
-  const framesToSend = Math.max(1, Math.round(elapsed / AUDIO_INTERVAL));
+  // Giai đoạn prebuffer
+  if (!audioStarted) {
+    audioPrebuffer.push(chunk);
+    audioPrebufferBytes += chunk.length;
 
-  for (let i = 0; i < framesToSend; i++) {
-    if (!audioPrimed) {
-      const targetBytes = Math.floor(
-        AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE *
-        audioTargetBufferMs / 1000
-      );
+    if (audioPrebufferBytes >= AUDIO_PREBUFFER_MAX_BYTES) {
+      // Burst bất thường — flush luôn
+      console.log("[AUDIO] Prebuffer hit safety cap, flushing early");
+      audioStarted = true;
+    } else if (audioPrebufferBytes >= AUDIO_PREBUFFER_BYTES) {
+      audioStarted = true;
+      console.log("[AUDIO] Prebuffer ready:", audioPrebufferBytes, "bytes — starting stream");
+    } else {
+      // Kiểm tra nguồn có thực sự phát audio không
+      const elapsed = (now - audioFirstByteAt) / 1000;
+      if (!audioStarvingLogged && elapsed > 5 && audioPrebufferBytes < 1000) {
+        audioStarvingLogged = true;
+        console.warn(
+          `[AUDIO] ⚠ Only ${audioPrebufferBytes}B in ${elapsed.toFixed(1)}s — ` +
+          `source may have slow/late audio`
+        );
+      }
+      return;
+    }
 
-      if (audioBuffer.length < targetBytes) {
-        // Phát hiện nguồn đang không có audio
-        if (audioBuffer.length === 0 && !audioFirstDataAt) {
-          if (!audioStarvingSince) {
-            audioStarvingSince = Date.now();
-          } else if (!audioStarvingWarned &&
-                     Date.now() - audioStarvingSince > AUDIO_STARVATION_WARN_MS) {
-            audioStarvingWarned = true;
-            console.warn(
-              `[AUDIO] ⚠ Source has produced NO audio for ` +
-              `${((Date.now() - audioStarvingSince) / 1000).toFixed(1)}s ` +
-              `— streaming silence. This is usually the SOURCE's fault ` +
-              `(delayed audio track), not this server.`
-            );
-          }
-        }
-        if (!writeAudioFrame(makeSilenceFrame(), true)) return;
+    // Flush toàn bộ prebuffer
+    for (const c of audioPrebuffer) {
+      if (audioClientSlow) {
+        audioBytesDropped += c.length;
         continue;
       }
-
-      audioPrimed = true;
-      console.log("[AUDIO] Prebuffer ready:", audioBuffer.length, "bytes");
+      const ok = audioClient.write(c);
+      if (ok) audioBytesSent += c.length;
+      else {
+        audioClientSlow = true;
+        audioBytesDropped += c.length;
+        audioClient.once("drain", () => { audioClientSlow = false; });
+      }
     }
-
-    const frame = takeAudioFrame();
-    if (!writeAudioFrame(frame, false)) return;
-  }
-}
-
-function scheduleAudioTick() {
-  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
-    audioTimer = null;
+    audioPrebuffer = [];
+    audioPrebufferBytes = 0;
     return;
   }
-  const now = Date.now();
-  const base = audioLastTick || now;
-  const next = base + AUDIO_INTERVAL;
-  const wait = Math.max(0, next - now);
-  audioTimer = setTimeout(() => {
-    audioTick();
-    scheduleAudioTick();
-  }, wait);
-}
 
-function startAudioTimer() {
-  if (audioTimer) { clearTimeout(audioTimer); audioTimer = null; }
-  audioLastTick = Date.now();
-  scheduleAudioTick();
+  // Giai đoạn live: drop nếu slow, không block
+  if (audioClientSlow) {
+    audioBytesDropped += chunk.length;
+    return;
+  }
+
+  const ok = audioClient.write(chunk);
+  if (ok) {
+    audioBytesSent += chunk.length;
+  } else {
+    audioClientSlow = true;
+    audioBytesDropped += chunk.length;
+    audioClient.once("drain", () => { audioClientSlow = false; });
+  }
 }
 
 // =====================================================
@@ -494,6 +322,7 @@ function clearVideoBuffer() {
 function broadcastFrame(frame) {
   if (!frame || !videoClientsMap.size) return;
   const now = Date.now();
+
   const header = Buffer.from(
     `--frame\r\n` +
     `Content-Type: image/jpeg\r\n` +
@@ -507,11 +336,12 @@ function broadcastFrame(frame) {
       cleanupVideoClient(res);
       continue;
     }
+
     if (state.blocked) {
       const blockDuration = now - state.blockedSince;
       if (blockDuration > MAX_CLIENT_BLOCK_MS) {
         console.log("[VIDEO] Slow client disconnected after",
-          blockDuration, "ms block (skipped:", state.skippedFrames, ")");
+          blockDuration, "ms (skipped:", state.skippedFrames, ")");
         cleanupVideoClient(res);
         try { res.destroy(); } catch (_) {}
         continue;
@@ -521,21 +351,26 @@ function broadcastFrame(frame) {
         continue;
       }
     }
+
     if (state.lastSentSequence === frameSequence) continue;
+
     if (state.clientInterval > 0) {
-      const timeSinceLastSend = now - state.lastSentTime;
-      if (timeSinceLastSend < state.clientInterval * 0.9) {
+      const dt = now - state.lastSentTime;
+      if (dt < state.clientInterval * 0.9) {
         state.skippedFrames++;
         continue;
       }
     }
+
     try {
       let ok = res.write(header);
       if (!res.write(frame)) ok = false;
       if (!res.write(trailer)) ok = false;
+
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
       videoSentFrames++;
+
       if (!ok) {
         if (!state.blocked) {
           state.blocked = true;
@@ -563,10 +398,12 @@ function cleanupVideoClient(res) {
 
 function processVideoData(chunk, currentGeneration) {
   if (currentGeneration !== generation || !chunk?.length) return;
+
   if (chunk.length > MAX_VIDEO_BUFFER) {
     chunk = chunk.subarray(chunk.length - MAX_VIDEO_BUFFER);
     videoInvalidFrames++;
   }
+
   if (jpegPending.length + chunk.length > MAX_VIDEO_BUFFER) {
     const combined = Buffer.concat([jpegPending, chunk]);
     const lastStart = combined.lastIndexOf(JPEG_SOI);
@@ -579,6 +416,7 @@ function processVideoData(chunk, currentGeneration) {
       ? Buffer.concat([jpegPending, chunk])
       : Buffer.from(chunk);
   }
+
   while (jpegPending.length) {
     const start = jpegPending.indexOf(JPEG_SOI);
     if (start < 0) {
@@ -588,6 +426,7 @@ function processVideoData(chunk, currentGeneration) {
       return;
     }
     if (start > 0) jpegPending = jpegPending.subarray(start);
+
     const end = jpegPending.indexOf(JPEG_EOI, 2);
     if (end < 0) {
       if (jpegPending.length > MAX_JPEG_FRAME_BYTES) {
@@ -599,12 +438,14 @@ function processVideoData(chunk, currentGeneration) {
       }
       return;
     }
+
     const frameLength = end + 2;
     if (frameLength > MAX_JPEG_FRAME_BYTES) {
       videoInvalidFrames++;
       jpegPending = jpegPending.subarray(frameLength);
       continue;
     }
+
     latestFrame = Buffer.from(jpegPending.subarray(0, frameLength));
     frameSequence++;
     lastVideoFrameTime = Date.now();
@@ -614,101 +455,11 @@ function processVideoData(chunk, currentGeneration) {
 }
 
 // =====================================================
-// AUDIO FFMPEG — PROCESS RIÊNG
-// =====================================================
-
-function stopAudioFFmpeg() {
-  if (audioRestartTimer) {
-    clearTimeout(audioRestartTimer);
-    audioRestartTimer = null;
-  }
-  if (audioFFmpeg) {
-    const old = audioFFmpeg;
-    audioFFmpeg = null;
-    try { old.kill("SIGKILL"); } catch (_) {}
-  }
-}
-
-function startAudioFFmpeg(channel, currentGeneration) {
-  stopAudioFFmpeg();
-
-  if (!channel?.url) return;
-
-  const args = [
-    "-hide_banner",
-    "-loglevel", "warning",
-    "-nostdin",
-    "-rw_timeout", "30000000",
-    "-reconnect", "1",
-    "-reconnect_streamed", "1",
-    "-reconnect_delay_max", "5",
-    "-user_agent", "Mozilla/5.0",
-    "-fflags", "+discardcorrupt+genpts",
-    "-threads", String(AUDIO_THREADS),
-    "-re",
-    "-i", channel.url,
-    "-vn",
-    "-map", "0:a:0?",
-    // 🔥 Filter đã đơn giản hóa: chỉ resample + reset PTS theo sample count.
-    // Bỏ async=1000:min_hard_comp=0.100:first_pts=0 vì nó gây vấp 30s đầu
-    // khi PTS gốc không bắt đầu từ 0.
-    "-af", `aresample=${AUDIO_SAMPLE_RATE},asetpts=N/SR/TB`,
-    "-ac", String(AUDIO_CHANNELS),
-    "-ar", String(AUDIO_SAMPLE_RATE),
-    "-c:a", "pcm_s16le",
-    "-flush_packets", "1",
-    "-f", "s16le",
-    "pipe:1"
-  ];
-
-  const child = spawn("ffmpeg", args, {
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  audioFFmpeg = child;
-
-  child.stdout.on("data", chunk => {
-    if (currentGeneration === generation) {
-      pushAudioBuffer(chunk);
-    }
-  });
-
-  child.stderr.on("data", data => {
-    const msg = data.toString().trim();
-    if (msg) console.log("[AUDIO FFmpeg]", msg);
-  });
-
-  child.on("error", error => {
-    console.error("[AUDIO FFMPEG ERROR]", error.message);
-  });
-
-  child.on("close", (code, signal) => {
-    console.log("[AUDIO FFmpeg] Exited:", code, signal);
-    if (currentGeneration !== generation) return;
-    audioFFmpeg = null;
-    // Tự phục hồi nếu chưa manuallyStopped
-    if (!manuallyStopped && currentChannel === channel) {
-      audioRestartTimer = setTimeout(() => {
-        audioRestartTimer = null;
-        if (!manuallyStopped && currentChannel === channel &&
-            currentGeneration === generation) {
-          console.log("[AUDIO] Restarting audio pipeline...");
-          startAudioFFmpeg(channel, currentGeneration);
-        }
-      }, AUDIO_RESTART_DELAY);
-    }
-  });
-}
-
-// =====================================================
-// VIDEO FFMPEG LIFECYCLE
+// FFMPEG LIFECYCLE (SINGLE PROCESS)
 // =====================================================
 
 function clearWatchdog() {
-  if (watchdogTimer) {
-    clearInterval(watchdogTimer);
-    watchdogTimer = null;
-  }
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
 }
 
 function stopFFmpeg() {
@@ -717,12 +468,8 @@ function stopFFmpeg() {
   restarting = false;
 
   clearWatchdog();
-  stopAudioFFmpeg();
 
-  if (restartTimer) {
-    clearTimeout(restartTimer);
-    restartTimer = null;
-  }
+  if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
 
   disconnectAudioClient();
 
@@ -742,10 +489,7 @@ function stopFFmpeg() {
 }
 
 function startFFmpeg(channel) {
-  if (!channel?.url) {
-    console.log("[FFMPEG] Invalid channel");
-    return;
-  }
+  if (!channel?.url) { console.log("[FFMPEG] Invalid channel"); return; }
 
   stopFFmpeg();
 
@@ -753,9 +497,18 @@ function startFFmpeg(channel) {
   currentChannel = channel;
 
   clearVideoBuffer();
-  resetAudioState(true);
 
-  videoDroppedFrames = 0;
+  // Reset audio state (nhưng KHÔNG đóng client nếu đang có)
+  audioStarted = false;
+  audioPrebuffer = [];
+  audioPrebufferBytes = 0;
+  audioBytesReceived = 0;
+  audioBytesSent = 0;
+  audioBytesDropped = 0;
+  audioFirstByteAt = 0;
+  audioLastByteAt = 0;
+  audioStarvingLogged = false;
+
   videoInvalidFrames = 0;
   videoSentFrames = 0;
 
@@ -767,11 +520,10 @@ function startFFmpeg(channel) {
   console.log("\n==================================");
   console.log("CHANNEL:", channel.name);
   console.log("GENERATION:", currentGeneration);
-  console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS} (max)`);
-  console.log("QUALITY:", qualityPreset.label, "JPEG q:", qualityPreset.jpegQuality);
-  console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-  console.log("AUDIO_BUFFER_MAX:", AUDIO_BUFFER_MAX, "bytes =", AUDIO_BUFFER_MS, "ms");
-  console.log("AUDIO_MODE: separate FFmpeg process");
+  console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
+  console.log("QUALITY:", qualityPreset.label);
+  console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM (passthrough)`);
+  console.log("MODE: single FFmpeg — audio never pauses FFmpeg");
   console.log("==================================");
 
   const videoFilter = [
@@ -780,7 +532,10 @@ function startFFmpeg(channel) {
     "setsar=1"
   ].join(",");
 
-  // 🔥 VIDEO-ONLY FFmpeg: không còn -map audio, không còn pipe:3
+  // 🔥 SINGLE FFmpeg, hai output:
+  //   pipe:1 → MJPEG video
+  //   pipe:3 → PCM s16le audio
+  // Bỏ hoàn toàn first_pts=0, async, min_hard_comp → hết garbled audio.
   const args = [
     "-hide_banner",
     "-loglevel", "warning",
@@ -795,6 +550,8 @@ function startFFmpeg(channel) {
     "-filter_threads", "1",
     "-re",
     "-i", channel.url,
+
+    // OUTPUT 1: VIDEO
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
@@ -805,11 +562,21 @@ function startFFmpeg(channel) {
     "-fps_mode", "cfr",
     "-flush_packets", "1",
     "-f", "image2pipe",
-    "pipe:1"
+    "pipe:1",
+
+    // OUTPUT 2: AUDIO — không filter, chỉ resample tự động
+    "-map", "0:a:0?",
+    "-vn",
+    "-ac", String(AUDIO_CHANNELS),
+    "-ar", String(AUDIO_SAMPLE_RATE),
+    "-c:a", "pcm_s16le",
+    "-flush_packets", "1",
+    "-f", "s16le",
+    "pipe:3"
   ];
 
   const child = spawn("ffmpeg", args, {
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe", "pipe"]
   });
 
   ffmpeg = child;
@@ -817,6 +584,14 @@ function startFFmpeg(channel) {
   child.stdout.on("data", chunk => {
     processVideoData(chunk, currentGeneration);
   });
+
+  if (child.stdio[3]) {
+    child.stdio[3].on("data", chunk => {
+      if (currentGeneration === generation) {
+        handleAudioChunk(chunk);
+      }
+    });
+  }
 
   child.stderr.on("data", data => {
     const message = data.toString().trim();
@@ -831,15 +606,9 @@ function startFFmpeg(channel) {
     console.log("[FFmpeg] Exited:", code, signal);
     if (currentGeneration !== generation) return;
     ffmpeg = null;
-    clearAudioBuffer();
     clearVideoBuffer();
-    if (!manuallyStopped) {
-      scheduleRestart();
-    }
+    if (!manuallyStopped) scheduleRestart();
   });
-
-  // 🔥 Khởi động audio FFmpeg riêng (chạy song song)
-  startAudioFFmpeg(channel, currentGeneration);
 
   watchdogTimer = setInterval(() => {
     if (currentGeneration !== generation || !ffmpeg || restarting) return;
@@ -859,7 +628,6 @@ function scheduleRestart() {
   disconnectAudioClient();
   clearVideoBuffer();
   clearWatchdog();
-  stopAudioFFmpeg();
 
   if (ffmpeg) {
     const old = ffmpeg;
@@ -872,9 +640,7 @@ function scheduleRestart() {
   restartTimer = setTimeout(() => {
     restartTimer = null;
     restarting = false;
-    if (currentChannel && !manuallyStopped) {
-      startFFmpeg(currentChannel);
-    }
+    if (currentChannel && !manuallyStopped) startFFmpeg(currentChannel);
   }, RESTART_DELAY);
 }
 
@@ -892,8 +658,7 @@ app.get("/stream", (req, res) => {
 
   const clientInterval = clientFps >= VIDEO_FPS ? 0 : (1000 / clientFps);
 
-  console.log("[VIDEO] Client connected - requested fps:",
-    req.query.fps || "default", "→ effective fps:", clientFps);
+  console.log("[VIDEO] Client connected fps:", clientFps);
 
   res.writeHead(200, {
     "Content-Type": "multipart/x-mixed-replace; boundary=frame",
@@ -942,8 +707,16 @@ app.get("/stream", (req, res) => {
 
 app.get("/audio", (req, res) => {
   disconnectAudioClient();
-  resetAudioState(false);
+
   audioClient = res;
+  audioClientSlow = false;
+  audioStarted = false;
+  audioPrebuffer = [];
+  audioPrebufferBytes = 0;
+  audioBytesReceived = 0;
+  audioBytesSent = 0;
+  audioBytesDropped = 0;
+  audioStarvingLogged = false;
 
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/octet-stream");
@@ -952,8 +725,7 @@ app.get("/audio", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  console.log("[AUDIO] Client connected; sending silence until prebuffer ready");
-  startAudioTimer();
+  console.log("[AUDIO] Client connected");
 
   res.on("close", () => {
     if (audioClient === res) {
@@ -1080,10 +852,7 @@ app.get("/api/bandwidth", async (req, res) => {
     for (const id of RENDER_SERVICE_IDS) url.searchParams.append("resource", id);
 
     const response = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${RENDER_API_KEY}`,
-        Accept: "application/json"
-      },
+      headers: { Authorization: `Bearer ${RENDER_API_KEY}`, Accept: "application/json" },
       signal: AbortSignal.timeout(20000)
     });
 
@@ -1104,7 +873,7 @@ app.get("/api/bandwidth", async (req, res) => {
 
     for (const series of data) {
       const labels = Array.isArray(series.labels) ? series.labels : [];
-      const serviceLabel = labels.find(item => item.field === "service");
+      const serviceLabel = labels.find(i => i.field === "service");
       const serviceId = serviceLabel ? serviceLabel.value : "unknown";
       const unit = String(series.unit || "GB").toUpperCase();
       let serviceGB = 0;
@@ -1138,9 +907,7 @@ app.get("/api/bandwidth", async (req, res) => {
     res.json({
       success: true, provider: "Render Official API",
       period: { start: start.toISOString(), end: now.toISOString(), timezone: "UTC" },
-      bandwidth: {
-        limitGB: BANDWIDTH_LIMIT_GB, usedGB, remainingGB, usedPercent, remainingPercent
-      },
+      bandwidth: { limitGB: BANDWIDTH_LIMIT_GB, usedGB, remainingGB, usedPercent, remainingPercent },
       resetInSeconds, resetAt: resetAt.toISOString(),
       status, services, serviceCount: RENDER_SERVICE_IDS.length,
       returnedSeries: data.length, totalDataPoints: totalPoints,
@@ -1154,7 +921,7 @@ app.get("/api/bandwidth", async (req, res) => {
 });
 
 // =====================================================
-// HEALTH — có chẩn đoán audio mới
+// HEALTH
 // =====================================================
 
 app.get("/health", (req, res) => {
@@ -1165,7 +932,6 @@ app.get("/health", (req, res) => {
   for (const [, state] of videoClientsMap) {
     clientDetails.push({
       fps: state.clientFps,
-      interval: state.clientInterval,
       skipped: state.skippedFrames,
       blockCount: state.blockCount,
       blocked: state.blocked,
@@ -1174,79 +940,56 @@ app.get("/health", (req, res) => {
     });
   }
 
-  const bufferCapacityMs = Math.round(
-    AUDIO_BUFFER_MAX / (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE) * 1000
-  );
-
   res.json({
     status: "running",
     channelCount: channels.length,
     currentChannel: currentChannel ? currentChannel.name : null,
     ffmpegRunning: !!ffmpeg,
-    audioFFmpegRunning: !!audioFFmpeg,
     restarting,
     manuallyStopped,
-
-    pipeline: "SEPARATE_FFMPEG_VIDEO_PLUS_AUDIO_AUTO_RECOVER",
+    pipeline: "SINGLE_FFMPEG_VIDEO_PLUS_AUDIO_PASSTHROUGH",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
-    defaultClientFps: DEFAULT_CLIENT_FPS,
-    skipThresholdMs: CLIENT_SKIP_THRESHOLD_MS,
-    maxClientBlockMs: MAX_CLIENT_BLOCK_MS,
-    videoDroppedFrames,
     videoInvalidFrames,
     videoSentFrames,
     videoClients,
     videoPendingBytes: jpegPending.length,
     videoLatestFrameBytes: latestFrame ? latestFrame.length : 0,
-    videoFrameSequence: frameSequence,
     videoFrameAge: lastVideoFrameTime ? now - lastVideoFrameTime : null,
     clientDetails,
 
-    // ===== AUDIO =====
-    audioSampleRate: AUDIO_SAMPLE_RATE,
-    audioChannels: AUDIO_CHANNELS,
-    audioFrameBytes: AUDIO_FRAME_BYTES,
-    audioInterval: AUDIO_INTERVAL,
-    audioBufferBytes: audioBuffer.length,
-    audioBufferMax: AUDIO_BUFFER_MAX,
-    audioBufferCapacityMs: bufferCapacityMs,
-    audioBufferUsagePercent: Number((audioBuffer.length / AUDIO_BUFFER_MAX * 100).toFixed(1)),
-    audioStartBufferMs: AUDIO_START_BUFFER_MS,
-    audioTargetBufferMs,
-    audioPrimed,
-    audioMaxObservedBytes,
-    audioClientConnected: !!audioClient && !audioClient.destroyed,
-    audioBlocked,
-    audioUnderflows,
-    audioOverflowBytes,
-    audioSilenceBytes,
-    audioFramesSent,
-    audioSilenceSent,
-
-    // ===== AUDIO DIAGNOSTICS =====
-    audioDiagnostics: {
-      bufferCapacityMs,
-      targetMaxMs: AUDIO_TARGET_MAX_MS,
-      bufferFitsTarget: AUDIO_BUFFER_MAX >=
-        (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE * AUDIO_TARGET_MAX_MS / 1000),
-      firstDataAgoSeconds: audioFirstDataAt
-        ? Number(((now - audioFirstDataAt) / 1000).toFixed(1)) : null,
-      starving: audioStarvingSince > 0,
-      starvingSeconds: audioStarvingSince > 0
-        ? Number(((now - audioStarvingSince) / 1000).toFixed(1)) : 0,
-      sourceTrễ: !audioFirstDataAt && audioStarvingWarned
-        ? "Có thể nguồn chưa phát audio track — kiểm tra bằng ffprobe trên kênh này"
+    audio: {
+      clientConnected: !!audioClient && !audioClient.destroyed,
+      clientSlow: audioClientSlow,
+      started: audioStarted,
+      sampleRate: AUDIO_SAMPLE_RATE,
+      channels: AUDIO_CHANNELS,
+      prebufferBytes: audioPrebufferBytes,
+      prebufferTargetBytes: AUDIO_PREBUFFER_BYTES,
+      bytesReceived: audioBytesReceived,
+      bytesSent: audioBytesSent,
+      bytesDropped: audioBytesDropped,
+      dropPercent: audioBytesReceived > 0
+        ? Number((audioBytesDropped / audioBytesReceived * 100).toFixed(2))
+        : 0,
+      firstByteAgoSeconds: audioFirstByteAt
+        ? Number(((now - audioFirstByteAt) / 1000).toFixed(1))
+        : null,
+      lastByteAgoSeconds: audioLastByteAt
+        ? Number(((now - audioLastByteAt) / 1000).toFixed(1))
+        : null,
+      starving: audioStarvingLogged,
+      note: !audioFirstByteAt && ffmpeg
+        ? "Chưa nhận được byte audio nào — nguồn có thể chưa phát audio track"
         : null
     },
 
     memory: {
       rssMB: Number((memory.rss / 1048576).toFixed(2)),
       heapUsedMB: Number((memory.heapUsed / 1048576).toFixed(2)),
-      externalMB: Number((memory.external / 1048576).toFixed(2)),
-      arrayBuffersMB: Number((memory.arrayBuffers / 1048576).toFixed(2))
+      externalMB: Number((memory.external / 1048576).toFixed(2))
     },
 
     lastVideoFrameTime,
@@ -1260,14 +1003,12 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER RUNNING - SEPARATE FFmpeg VIDEO + AUDIO PIPELINE\n" +
-    "Usage:\n" +
+    "IPTV SERVER - SINGLE FFmpeg + AUDIO PASSTHROUGH\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
-    "  /stream?fps=6        → 6 fps\n" +
-    "  /audio               → PCM audio\n" +
-    "\nAudio buffer capacity: " + AUDIO_BUFFER_MS + "ms (fix from previous 800ms cap)\n" +
-    "\nDiagnose audio via /health → audioDiagnostics\n"
+    "  /audio               → PCM " + AUDIO_SAMPLE_RATE + "Hz mono s16le\n" +
+    "  /health              → diagnostics\n" +
+    "\nAudio: KHÔNG cắt frame, KHÔNG pad silence, drop khi client chậm.\n"
   );
 });
 
@@ -1283,11 +1024,8 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log("VIDEO (max):", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
-    console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM`);
-    console.log("AUDIO_BUFFER_MAX:", AUDIO_BUFFER_MAX, "bytes =", AUDIO_BUFFER_MS, "ms");
-    console.log("PIPELINE: SEPARATE FFmpeg (video pipe:1 + audio pipe:1)");
-    console.log("STREAM API: /stream?fps=N  (N = 1..30)");
+    console.log("PIPELINE: SINGLE FFmpeg (video pipe:1 + audio pipe:3)");
+    console.log("AUDIO:", `${AUDIO_SAMPLE_RATE}Hz mono PCM passthrough`);
     console.log("--------------------------------");
   });
 }
