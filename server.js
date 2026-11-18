@@ -63,7 +63,7 @@ const AUDIO_BYTES_PER_MS =
 // Startup buffer — prime 1500ms để có đủ slack từ byte đầu tiên
 // (đây là điểm cân bằng: start chậm hơn ~500ms so với bản gốc,
 // nhưng mượt ngay từ đầu thay vì 30s sau mới mượt)
-const AUDIO_START_BUFFER_MS = 3000;
+const AUDIO_START_BUFFER_MS = 300;
 
 // Buffer tối đa — tăng lên 3500ms để chống jitter 4G (Termux/3G/4G)
 const AUDIO_BUFFER_MS = 3500;
