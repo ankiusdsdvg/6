@@ -42,15 +42,20 @@ let currentQualityId = "1080p";
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_CHANNELS = 1;
 const AUDIO_BYTES_PER_SAMPLE = 2;
+const AUDIO_BYTES_PER_MS =
+  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE / 1000;
 
-const AUDIO_PREBUFFER_BYTES =
-  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE * 0.3;
-const AUDIO_PREBUFFER_MAX_BYTES =
-  AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE * 5;
+// Prebuffer ngắn — chỉ đủ để start smooth, không chờ lâu
+const AUDIO_PREBUFFER_MS = 200;
+const AUDIO_PREBUFFER_BYTES = AUDIO_BYTES_PER_MS * AUDIO_PREBUFFER_MS;
 
-const AUDIO_WARMUP_MS = Number(process.env.AUDIO_WARMUP_MS || 28000);
+// Nếu burst đầu tiên (HLS segment) làm buffer phình to → flush sớm
+const AUDIO_PREBUFFER_MAX_BYTES = AUDIO_BYTES_PER_MS * 1000; // 1s
 
-// 🔥 Tăng decoder threads — Termux thường có 4-8 core, dùng 3-4 cho decode
+// Sau khi started, nếu buffer > 2s → drop phần cũ để giữ real-time
+const AUDIO_LIVE_MAX_BYTES = AUDIO_BYTES_PER_MS * 2000; // 2s
+
+// 🔥 Tăng decoder threads cho Termux
 const DECODER_THREADS = Math.min(4, Math.max(2, os.cpus().length - 1));
 const ENCODER_THREADS = 1;
 
@@ -87,12 +92,12 @@ let latestFrame = null;
 let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
-// 🔥 FRAME BROADCAST TIMER — tách FFmpeg khỏi client
+// Fixed-rate video broadcast
 let frameBroadcastTimer = null;
 let lastBroadcastSeq = -1;
 let lastBroadcastTime = 0;
 
-// Diagnostic: đo FPS thực tế FFmpeg xuất
+// Diagnostic
 let frameTimestamps = [];
 
 let videoInvalidFrames = 0;
@@ -100,24 +105,19 @@ let videoSentFrames = 0;
 let videoClients = 0;
 const videoClientsMap = new Map();
 
-// ===== AUDIO STATE =====
+// ===== AUDIO STATE (không warmup) =====
 let audioClient = null;
 let audioClientSlow = false;
 let audioPrebuffer = [];
 let audioPrebufferBytes = 0;
 let audioStarted = false;
 
-let streamStartedAt = 0;
-let audioWarmupDone = false;
-let audioWarmupDroppedBytes = 0;
-
 let audioBytesReceived = 0;
 let audioBytesSent = 0;
 let audioBytesDropped = 0;
+let audioBurstDropped = 0;
 let audioFirstByteAt = 0;
 let audioLastByteAt = 0;
-let audioStarvingLogged = false;
-let audioLastWarmupLogAt = 0;
 
 let watchdogTimer = null;
 let restartTimer = null;
@@ -226,7 +226,7 @@ async function loadChannels() {
 }
 
 // =====================================================
-// AUDIO — PASSTHROUGH + WARMUP
+// AUDIO — PASSTHROUGH NGAY, KHÔNG WARMUP
 // =====================================================
 
 function disconnectAudioClient() {
@@ -241,6 +241,8 @@ function disconnectAudioClient() {
   }
 }
 
+// 🔥 LUÔN consume chunk → FFmpeg pipe:3 không bao giờ bị block.
+// Nếu không có client hoặc client chậm → drop. Không block event loop.
 function handleAudioChunk(chunk) {
   if (!chunk || !chunk.length) return;
   if (chunk.length & 1) chunk = chunk.subarray(0, chunk.length - 1);
@@ -249,62 +251,56 @@ function handleAudioChunk(chunk) {
   const now = Date.now();
   if (!audioFirstByteAt) {
     audioFirstByteAt = now;
-    console.log("[AUDIO] First byte from source arrived");
+    console.log("[AUDIO] First byte arrived — streaming immediately");
   }
   audioLastByteAt = now;
   audioBytesReceived += chunk.length;
 
-  // WARMUP
-  if (!audioWarmupDone) {
-    const elapsed = streamStartedAt ? now - streamStartedAt : 0;
-    if (elapsed < AUDIO_WARMUP_MS) {
-      audioBytesDropped += chunk.length;
-      audioWarmupDroppedBytes += chunk.length;
-      if (now - audioLastWarmupLogAt >= 5000) {
-        audioLastWarmupLogAt = now;
-        console.log(
-          `[AUDIO] Warmup ${(elapsed / 1000).toFixed(1)}s / ` +
-          `${(AUDIO_WARMUP_MS / 1000).toFixed(0)}s ` +
-          `— dropped ${(audioWarmupDroppedBytes / 1024).toFixed(1)} KB`
-        );
-      }
-      return;
-    }
-    audioWarmupDone = true;
-    audioStarted = false;
-    audioPrebuffer = [];
-    audioPrebufferBytes = 0;
-    audioLastWarmupLogAt = 0;
-    console.log(
-      `[AUDIO] ✅ Warmup complete after ${(elapsed / 1000).toFixed(1)}s ` +
-      `(dropped ${(audioWarmupDroppedBytes / 1024).toFixed(1)} KB)`
-    );
+  // Không có client → drop để FFmpeg pipe tiếp tục drain
+  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
+    return;
   }
 
-  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) return;
-
+  // ── PREBUFFER PHASE (rất ngắn, 200ms) ──
   if (!audioStarted) {
     audioPrebuffer.push(chunk);
     audioPrebufferBytes += chunk.length;
 
     if (audioPrebufferBytes >= AUDIO_PREBUFFER_MAX_BYTES) {
+      // Burst quá lớn (thường do HLS segment đầu) → giữ phần cuối, drop phần đầu
+      let totalKept = 0;
+      const kept = [];
+      // Đi từ cuối về đầu, giữ đủ AUDIO_PREBUFFER_MS
+      for (let i = audioPrebuffer.length - 1; i >= 0; i--) {
+        const c = audioPrebuffer[i];
+        if (totalKept + c.length <= AUDIO_PREBUFFER_BYTES) {
+          kept.unshift(c);
+          totalKept += c.length;
+        } else {
+          audioBurstDropped += c.length;
+          audioBytesDropped += c.length;
+        }
+      }
+      audioPrebuffer = kept;
+      audioPrebufferBytes = totalKept;
       audioStarted = true;
+      console.log(
+        `[AUDIO] Burst detected — kept only ${totalKept}B ` +
+        `(dropped ${audioBurstDropped}B)`
+      );
     } else if (audioPrebufferBytes >= AUDIO_PREBUFFER_BYTES) {
       audioStarted = true;
-      console.log("[AUDIO] Prebuffer ready:", audioPrebufferBytes, "bytes");
+      console.log(`[AUDIO] Prebuffer ready: ${audioPrebufferBytes}B — streaming`);
     } else {
-      const elapsed = (now - audioFirstByteAt) / 1000;
-      if (!audioStarvingLogged && elapsed > 5 && audioPrebufferBytes < 1000) {
-        audioStarvingLogged = true;
-        console.warn(
-          `[AUDIO] ⚠ Only ${audioPrebufferBytes}B in ${elapsed.toFixed(1)}s`
-        );
-      }
       return;
     }
 
+    // Flush prebuffer
     for (const c of audioPrebuffer) {
-      if (audioClientSlow) { audioBytesDropped += c.length; continue; }
+      if (audioClientSlow) {
+        audioBytesDropped += c.length;
+        continue;
+      }
       const ok = audioClient.write(c);
       if (ok) audioBytesSent += c.length;
       else {
@@ -318,7 +314,19 @@ function handleAudioChunk(chunk) {
     return;
   }
 
-  if (audioClientSlow) { audioBytesDropped += chunk.length; return; }
+  // ── LIVE PHASE ──
+  if (audioClientSlow) {
+    audioBytesDropped += chunk.length;
+    return;
+  }
+
+  // Nếu buffer phình > 2s (do burst) → không ghi thêm, chờ drain
+  // (cách đơn giản: kiểm tra writableLength — nếu lớn quá thì drop)
+  if (audioClient.writableLength > AUDIO_LIVE_MAX_BYTES) {
+    audioBytesDropped += chunk.length;
+    audioBurstDropped += chunk.length;
+    return;
+  }
 
   const ok = audioClient.write(chunk);
   if (ok) audioBytesSent += chunk.length;
@@ -340,11 +348,8 @@ function clearVideoBuffer() {
   frameTimestamps = [];
 }
 
-// 🔥 TIMER: Gửi frame mới nhất ở tần suất cố định, bất kể FFmpeg burst
 function startFrameBroadcastTimer() {
   if (frameBroadcastTimer) return;
-
-  // Check nhanh hơn FPS một chút để đảm bảo bám đúng nhịp
   const checkInterval = Math.max(8, Math.floor(VIDEO_INTERVAL / 2));
 
   frameBroadcastTimer = setInterval(() => {
@@ -352,7 +357,6 @@ function startFrameBroadcastTimer() {
     if (frameSequence === lastBroadcastSeq) return;
 
     const now = Date.now();
-    // Bám nhịp ~12fps, chừa 15% dung sai
     if (now - lastBroadcastTime < VIDEO_INTERVAL * 0.85) return;
 
     lastBroadcastSeq = frameSequence;
@@ -408,7 +412,6 @@ function broadcastFrame(frame) {
 
     if (state.lastSentSequence === frameSequence) continue;
 
-    // Per-client throttle (cho client fps < 12)
     if (state.clientInterval > 0) {
       const dt = now - state.lastSentTime;
       if (dt < state.clientInterval * 0.9) {
@@ -505,11 +508,9 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
-    // 🔥 Đo FPS thực tế
     frameTimestamps.push(lastVideoFrameTime);
     if (frameTimestamps.length > 120) frameTimestamps.shift();
 
-    // 🔥 KHÔNG broadcast ở đây nữa — timer lo
     jpegPending = jpegPending.subarray(frameLength);
   }
 }
@@ -559,21 +560,16 @@ function startFFmpeg(channel) {
 
   clearVideoBuffer();
 
-  // Reset audio
+  // Reset audio — audio phát ngay, không warmup
   audioStarted = false;
   audioPrebuffer = [];
   audioPrebufferBytes = 0;
   audioBytesReceived = 0;
   audioBytesSent = 0;
   audioBytesDropped = 0;
+  audioBurstDropped = 0;
   audioFirstByteAt = 0;
   audioLastByteAt = 0;
-  audioStarvingLogged = false;
-  audioLastWarmupLogAt = 0;
-
-  streamStartedAt = Date.now();
-  audioWarmupDone = false;
-  audioWarmupDroppedBytes = 0;
 
   videoInvalidFrames = 0;
   videoSentFrames = 0;
@@ -589,8 +585,8 @@ function startFFmpeg(channel) {
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
   console.log("DECODER THREADS:", DECODER_THREADS, "/ CPU cores:", os.cpus().length);
   console.log("QUALITY:", qualityPreset.label);
-  console.log("AUDIO WARMUP:", (AUDIO_WARMUP_MS / 1000).toFixed(0) + "s");
-  console.log("MODE: fixed-rate broadcast (decouples FFmpeg from client)");
+  console.log("AUDIO: phát ngay, prebuffer", AUDIO_PREBUFFER_MS, "ms");
+  console.log("MODE: fixed-rate video + immediate audio");
   console.log("==================================");
 
   const videoFilter = [
@@ -609,13 +605,13 @@ function startFFmpeg(channel) {
     "-reconnect_delay_max", "5",
     "-user_agent", "Mozilla/5.0",
     "-fflags", "+discardcorrupt+genpts",
-    "-thread_queue_size", "512",          // 🔥 tăng queue demuxer, chống burst HLS
+    "-thread_queue_size", "512",
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
     "-re",
     "-i", channel.url,
 
-    // VIDEO OUTPUT
+    // VIDEO
     "-map", "0:v:0?",
     "-an",
     "-vf", videoFilter,
@@ -628,7 +624,7 @@ function startFFmpeg(channel) {
     "-f", "image2pipe",
     "pipe:1",
 
-    // AUDIO OUTPUT
+    // AUDIO
     "-map", "0:a:0?",
     "-vn",
     "-ac", String(AUDIO_CHANNELS),
@@ -672,7 +668,6 @@ function startFFmpeg(channel) {
     if (!manuallyStopped) scheduleRestart();
   });
 
-  // 🔥 KHỞI ĐỘNG BROADCAST TIMER — đây là fix chính
   startFrameBroadcastTimer();
 
   watchdogTimer = setInterval(() => {
@@ -783,7 +778,7 @@ app.get("/audio", (req, res) => {
   audioBytesReceived = 0;
   audioBytesSent = 0;
   audioBytesDropped = 0;
-  audioStarvingLogged = false;
+  audioBurstDropped = 0;
 
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/octet-stream");
@@ -792,15 +787,9 @@ app.get("/audio", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  const remaining = audioWarmupDone
-    ? 0
-    : Math.max(0, AUDIO_WARMUP_MS - (Date.now() - streamStartedAt));
-
-  if (remaining > 0) {
-    console.log(`[AUDIO] Client connected — warmup ${(remaining / 1000).toFixed(1)}s remaining`);
-  } else {
-    console.log("[AUDIO] Client connected — warmup done, prebuffering 300ms");
-  }
+  console.log(
+    `[AUDIO] Client connected — prebuffer ${AUDIO_PREBUFFER_MS}ms rồi phát ngay`
+  );
 
   res.on("close", () => {
     if (audioClient === res) {
@@ -988,7 +977,7 @@ app.get("/api/bandwidth", async (req, res) => {
 });
 
 // =====================================================
-// HEALTH — có thêm FPS diagnostic
+// HEALTH
 // =====================================================
 
 function calculateFps(windowMs) {
@@ -1016,11 +1005,6 @@ app.get("/health", (req, res) => {
     });
   }
 
-  const warmupElapsed = streamStartedAt ? now - streamStartedAt : 0;
-  const warmupRemaining = audioWarmupDone
-    ? 0
-    : Math.max(0, AUDIO_WARMUP_MS - warmupElapsed);
-
   res.json({
     status: "running",
     channelCount: channels.length,
@@ -1028,7 +1012,7 @@ app.get("/health", (req, res) => {
     ffmpegRunning: !!ffmpeg,
     restarting,
     manuallyStopped,
-    pipeline: "SINGLE_FFMPEG_FIXED_RATE_BROADCAST",
+    pipeline: "FIXED_RATE_VIDEO_IMMEDIATE_AUDIO",
 
     videoWidth: VIDEO_WIDTH,
     videoHeight: VIDEO_HEIGHT,
@@ -1036,7 +1020,6 @@ app.get("/health", (req, res) => {
     decoderThreads: DECODER_THREADS,
     cpuCores: os.cpus().length,
 
-    // 🔥 DIAGNOSTIC QUAN TRỌNG NHẤT
     sourceFpsLast2s: calculateFps(2000),
     sourceFpsLast5s: calculateFps(5000),
     broadcastTimerActive: !!frameBroadcastTimer,
@@ -1055,20 +1038,26 @@ app.get("/health", (req, res) => {
       clientConnected: !!audioClient && !audioClient.destroyed,
       clientSlow: audioClientSlow,
       started: audioStarted,
-      warmupMs: AUDIO_WARMUP_MS,
-      warmupDone: audioWarmupDone,
-      warmupElapsedMs: warmupElapsed,
-      warmupRemainingMs: warmupRemaining,
-      warmupDroppedKB: Number((audioWarmupDroppedBytes / 1024).toFixed(1)),
+      prebufferMs: AUDIO_PREBUFFER_MS,
+      prebufferBytes: audioPrebufferBytes,
+      prebufferTargetBytes: AUDIO_PREBUFFER_BYTES,
       bytesReceived: audioBytesReceived,
       bytesSent: audioBytesSent,
       bytesDropped: audioBytesDropped,
+      burstDropped: audioBurstDropped,
       dropPercent: audioBytesReceived > 0
         ? Number((audioBytesDropped / audioBytesReceived * 100).toFixed(2))
         : 0,
+      clientSocketBufferBytes: audioClient ? audioClient.writableLength : 0,
       firstByteAgoSeconds: audioFirstByteAt
         ? Number(((now - audioFirstByteAt) / 1000).toFixed(1))
         : null,
+      lastByteAgoSeconds: audioLastByteAt
+        ? Number(((now - audioLastByteAt) / 1000).toFixed(1))
+        : null,
+      note: !audioStarted && audioPrebufferBytes > 0
+        ? `Đang prebuffer ${audioPrebufferBytes}/${AUDIO_PREBUFFER_BYTES} bytes`
+        : null
     },
 
     memory: {
@@ -1087,11 +1076,13 @@ app.get("/health", (req, res) => {
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER - FIXED-RATE BROADCAST\n" +
+    "IPTV SERVER - IMMEDIATE AUDIO + FIXED-RATE VIDEO\n" +
     "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
     "  /stream?fps=12       → 12 fps\n" +
-    "  /audio               → PCM " + AUDIO_SAMPLE_RATE + "Hz mono s16le\n" +
-    "  /health              → diagnostics (xem sourceFpsLast2s để biết FFmpeg có khỏe)\n"
+    "  /audio               → PCM " + AUDIO_SAMPLE_RATE + "Hz mono s16le (phát ngay)\n" +
+    "  /health              → diagnostics\n" +
+    "\nAudio: prebuffer " + AUDIO_PREBUFFER_MS + "ms rồi phát ngay, không warmup.\n" +
+    "Video: fixed-rate 12fps timer → hình luôn đều bất kể audio burst.\n"
   );
 });
 
@@ -1107,9 +1098,9 @@ async function main() {
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
     console.log("CHANNELS:", channels.length);
-    console.log("PIPELINE: FIXED-RATE BROADCAST (decoupled from FFmpeg)");
+    console.log("PIPELINE: IMMEDIATE AUDIO + FIXED-RATE VIDEO");
     console.log("DECODER THREADS:", DECODER_THREADS, "/ CPU cores:", os.cpus().length);
-    console.log("AUDIO WARMUP:", (AUDIO_WARMUP_MS / 1000).toFixed(0) + "s");
+    console.log("AUDIO PREBUFFER:", AUDIO_PREBUFFER_MS, "ms");
     console.log("--------------------------------");
   });
 }
