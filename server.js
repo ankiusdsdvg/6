@@ -45,17 +45,11 @@ const AUDIO_BYTES_PER_SAMPLE = 2;
 const AUDIO_BYTES_PER_MS =
   AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * AUDIO_BYTES_PER_SAMPLE / 1000;
 
-// Prebuffer ngắn — chỉ đủ để start smooth, không chờ lâu
 const AUDIO_PREBUFFER_MS = 200;
 const AUDIO_PREBUFFER_BYTES = AUDIO_BYTES_PER_MS * AUDIO_PREBUFFER_MS;
+const AUDIO_PREBUFFER_MAX_BYTES = AUDIO_BYTES_PER_MS * 1000;
+const AUDIO_LIVE_MAX_BYTES = AUDIO_BYTES_PER_MS * 2000;
 
-// Nếu burst đầu tiên (HLS segment) làm buffer phình to → flush sớm
-const AUDIO_PREBUFFER_MAX_BYTES = AUDIO_BYTES_PER_MS * 1000; // 1s
-
-// Sau khi started, nếu buffer > 2s → drop phần cũ để giữ real-time
-const AUDIO_LIVE_MAX_BYTES = AUDIO_BYTES_PER_MS * 2000; // 2s
-
-// 🔥 Tăng decoder threads cho Termux
 const DECODER_THREADS = Math.min(4, Math.max(2, os.cpus().length - 1));
 const ENCODER_THREADS = 1;
 
@@ -63,7 +57,7 @@ const WATCHDOG_INTERVAL = 5000;
 const VIDEO_TIMEOUT = 45000;
 const RESTART_DELAY = 3000;
 
-const MAX_VIDEO_BUFFER = 512 * 1024;
+const MAX_VIDEO_BUFFER = 1024 * 1024;  // 🔥 tăng từ 512KB → 1MB
 const MAX_JPEG_FRAME_BYTES = 256 * 1024;
 
 const CLIENT_SKIP_THRESHOLD_MS = 30;
@@ -92,12 +86,10 @@ let latestFrame = null;
 let frameSequence = 0;
 let jpegPending = Buffer.alloc(0);
 
-// Fixed-rate video broadcast
 let frameBroadcastTimer = null;
 let lastBroadcastSeq = -1;
 let lastBroadcastTime = 0;
 
-// Diagnostic
 let frameTimestamps = [];
 
 let videoInvalidFrames = 0;
@@ -105,7 +97,12 @@ let videoSentFrames = 0;
 let videoClients = 0;
 const videoClientsMap = new Map();
 
-// ===== AUDIO STATE (không warmup) =====
+// 🔥 Đo FFmpeg lifecycle
+let ffmpegStartedAt = 0;
+let firstFrameArrivedAt = 0;
+let inputStallCount = 0;
+let lastStallAt = 0;
+
 let audioClient = null;
 let audioClientSlow = false;
 let audioPrebuffer = [];
@@ -226,7 +223,7 @@ async function loadChannels() {
 }
 
 // =====================================================
-// AUDIO — PASSTHROUGH NGAY, KHÔNG WARMUP
+// AUDIO
 // =====================================================
 
 function disconnectAudioClient() {
@@ -241,36 +238,25 @@ function disconnectAudioClient() {
   }
 }
 
-// 🔥 LUÔN consume chunk → FFmpeg pipe:3 không bao giờ bị block.
-// Nếu không có client hoặc client chậm → drop. Không block event loop.
 function handleAudioChunk(chunk) {
   if (!chunk || !chunk.length) return;
   if (chunk.length & 1) chunk = chunk.subarray(0, chunk.length - 1);
   if (!chunk.length) return;
 
   const now = Date.now();
-  if (!audioFirstByteAt) {
-    audioFirstByteAt = now;
-    console.log("[AUDIO] First byte arrived — streaming immediately");
-  }
+  if (!audioFirstByteAt) audioFirstByteAt = now;
   audioLastByteAt = now;
   audioBytesReceived += chunk.length;
 
-  // Không có client → drop để FFmpeg pipe tiếp tục drain
-  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) {
-    return;
-  }
+  if (!audioClient || audioClient.destroyed || audioClient.writableEnded) return;
 
-  // ── PREBUFFER PHASE (rất ngắn, 200ms) ──
   if (!audioStarted) {
     audioPrebuffer.push(chunk);
     audioPrebufferBytes += chunk.length;
 
     if (audioPrebufferBytes >= AUDIO_PREBUFFER_MAX_BYTES) {
-      // Burst quá lớn (thường do HLS segment đầu) → giữ phần cuối, drop phần đầu
       let totalKept = 0;
       const kept = [];
-      // Đi từ cuối về đầu, giữ đủ AUDIO_PREBUFFER_MS
       for (let i = audioPrebuffer.length - 1; i >= 0; i--) {
         const c = audioPrebuffer[i];
         if (totalKept + c.length <= AUDIO_PREBUFFER_BYTES) {
@@ -284,23 +270,14 @@ function handleAudioChunk(chunk) {
       audioPrebuffer = kept;
       audioPrebufferBytes = totalKept;
       audioStarted = true;
-      console.log(
-        `[AUDIO] Burst detected — kept only ${totalKept}B ` +
-        `(dropped ${audioBurstDropped}B)`
-      );
     } else if (audioPrebufferBytes >= AUDIO_PREBUFFER_BYTES) {
       audioStarted = true;
-      console.log(`[AUDIO] Prebuffer ready: ${audioPrebufferBytes}B — streaming`);
     } else {
       return;
     }
 
-    // Flush prebuffer
     for (const c of audioPrebuffer) {
-      if (audioClientSlow) {
-        audioBytesDropped += c.length;
-        continue;
-      }
+      if (audioClientSlow) { audioBytesDropped += c.length; continue; }
       const ok = audioClient.write(c);
       if (ok) audioBytesSent += c.length;
       else {
@@ -314,14 +291,7 @@ function handleAudioChunk(chunk) {
     return;
   }
 
-  // ── LIVE PHASE ──
-  if (audioClientSlow) {
-    audioBytesDropped += chunk.length;
-    return;
-  }
-
-  // Nếu buffer phình > 2s (do burst) → không ghi thêm, chờ drain
-  // (cách đơn giản: kiểm tra writableLength — nếu lớn quá thì drop)
+  if (audioClientSlow) { audioBytesDropped += chunk.length; return; }
   if (audioClient.writableLength > AUDIO_LIVE_MAX_BYTES) {
     audioBytesDropped += chunk.length;
     audioBurstDropped += chunk.length;
@@ -338,7 +308,7 @@ function handleAudioChunk(chunk) {
 }
 
 // =====================================================
-// VIDEO — FIXED-RATE BROADCAST
+// VIDEO
 // =====================================================
 
 function clearVideoBuffer() {
@@ -346,6 +316,7 @@ function clearVideoBuffer() {
   latestFrame = null;
   frameSequence = 0;
   frameTimestamps = [];
+  firstFrameArrivedAt = 0;
 }
 
 function startFrameBroadcastTimer() {
@@ -363,15 +334,12 @@ function startFrameBroadcastTimer() {
     lastBroadcastTime = now;
     broadcastFrame(latestFrame);
   }, checkInterval);
-
-  console.log("[VIDEO] Fixed-rate broadcast timer started");
 }
 
 function stopFrameBroadcastTimer() {
   if (frameBroadcastTimer) {
     clearInterval(frameBroadcastTimer);
     frameBroadcastTimer = null;
-    console.log("[VIDEO] Fixed-rate broadcast timer stopped");
   }
   lastBroadcastSeq = -1;
   lastBroadcastTime = 0;
@@ -394,12 +362,9 @@ function broadcastFrame(frame) {
       cleanupVideoClient(res);
       continue;
     }
-
     if (state.blocked) {
       const blockDuration = now - state.blockedSince;
       if (blockDuration > MAX_CLIENT_BLOCK_MS) {
-        console.log("[VIDEO] Slow client disconnected after",
-          blockDuration, "ms (skipped:", state.skippedFrames, ")");
         cleanupVideoClient(res);
         try { res.destroy(); } catch (_) {}
         continue;
@@ -409,9 +374,7 @@ function broadcastFrame(frame) {
         continue;
       }
     }
-
     if (state.lastSentSequence === frameSequence) continue;
-
     if (state.clientInterval > 0) {
       const dt = now - state.lastSentTime;
       if (dt < state.clientInterval * 0.9) {
@@ -419,16 +382,13 @@ function broadcastFrame(frame) {
         continue;
       }
     }
-
     try {
       let ok = res.write(header);
       if (!res.write(frame)) ok = false;
       if (!res.write(trailer)) ok = false;
-
       state.lastSentSequence = frameSequence;
       state.lastSentTime = now;
       videoSentFrames++;
-
       if (!ok) {
         if (!state.blocked) {
           state.blocked = true;
@@ -441,7 +401,6 @@ function broadcastFrame(frame) {
         });
       }
     } catch (error) {
-      console.error("[VIDEO WRITE]", error.message);
       cleanupVideoClient(res);
       try { res.destroy(); } catch (_) {}
     }
@@ -508,6 +467,24 @@ function processVideoData(chunk, currentGeneration) {
     frameSequence++;
     lastVideoFrameTime = Date.now();
 
+    if (!firstFrameArrivedAt) {
+      firstFrameArrivedAt = lastVideoFrameTime;
+      const waited = ffmpegStartedAt ? (firstFrameArrivedAt - ffmpegStartedAt) / 1000 : 0;
+      console.log(`[VIDEO] First frame after ${waited.toFixed(2)}s`);
+    }
+
+    // Đo stall: nếu khoảng cách giữa 2 frame > 2 * interval
+    if (frameTimestamps.length) {
+      const gap = lastVideoFrameTime - frameTimestamps[frameTimestamps.length - 1];
+      if (gap > VIDEO_INTERVAL * 2.5) {
+        inputStallCount++;
+        lastStallAt = lastVideoFrameTime;
+        if (inputStallCount <= 10 || inputStallCount % 20 === 0) {
+          console.log(`[VIDEO] ⚠ Input stall #${inputStallCount}: gap ${gap}ms`);
+        }
+      }
+    }
+
     frameTimestamps.push(lastVideoFrameTime);
     if (frameTimestamps.length > 120) frameTimestamps.shift();
 
@@ -527,22 +504,16 @@ function stopFFmpeg() {
   generation++;
   manuallyStopped = true;
   restarting = false;
-
   clearWatchdog();
   stopFrameBroadcastTimer();
-
   if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
-
   disconnectAudioClient();
-
   for (const res of videoClientsMap.keys()) {
     try { res.destroy(); } catch (_) {}
   }
   videoClientsMap.clear();
   videoClients = 0;
-
   clearVideoBuffer();
-
   if (ffmpeg) {
     const old = ffmpeg;
     ffmpeg = null;
@@ -557,10 +528,8 @@ function startFFmpeg(channel) {
 
   manuallyStopped = false;
   currentChannel = channel;
-
   clearVideoBuffer();
 
-  // Reset audio — audio phát ngay, không warmup
   audioStarted = false;
   audioPrebuffer = [];
   audioPrebufferBytes = 0;
@@ -573,20 +542,24 @@ function startFFmpeg(channel) {
 
   videoInvalidFrames = 0;
   videoSentFrames = 0;
+  inputStallCount = 0;
+  lastStallAt = 0;
 
   const currentGeneration = generation;
   const qualityPreset = getCurrentQualityPreset();
 
-  lastVideoFrameTime = Date.now();
+  ffmpegStartedAt = Date.now();
+  lastVideoFrameTime = ffmpegStartedAt;
+
+  const isHls = /\.m3u8(\?|$)/i.test(channel.url);
 
   console.log("\n==================================");
   console.log("CHANNEL:", channel.name);
+  console.log("URL TYPE:", isHls ? "HLS" : "HTTP/other");
   console.log("GENERATION:", currentGeneration);
   console.log("VIDEO:", `${VIDEO_WIDTH}x${VIDEO_HEIGHT}@${VIDEO_FPS}`);
   console.log("DECODER THREADS:", DECODER_THREADS, "/ CPU cores:", os.cpus().length);
-  console.log("QUALITY:", qualityPreset.label);
-  console.log("AUDIO: phát ngay, prebuffer", AUDIO_PREBUFFER_MS, "ms");
-  console.log("MODE: fixed-rate video + immediate audio");
+  console.log("MODE: no -re, buffered input, live_start_index -3");
   console.log("==================================");
 
   const videoFilter = [
@@ -595,22 +568,45 @@ function startFFmpeg(channel) {
     "setsar=1"
   ].join(",");
 
-  const args = [
+  // 🔥 FFmpeg args mới — BỎ -re, tăng buffer input, dùng HLS live_start_index
+  const inputArgs = [
     "-hide_banner",
     "-loglevel", "warning",
     "-nostdin",
+
+    // === INPUT BUFFERING ===
+    "-probesize", "5M",
+    "-analyzeduration", "10000000",
+    "-thread_queue_size", "2048",        // 🔥 tăng từ 512 → 2048
+    "-max_delay", "500000",              // chờ tối đa 500ms
+    "-reorder_queue_size", "4096",
+
+    // === RECONNECT ===
     "-rw_timeout", "30000000",
     "-reconnect", "1",
     "-reconnect_streamed", "1",
-    "-reconnect_delay_max", "5",
+    "-reconnect_at_eof", "1",
+    "-reconnect_delay_max", "30",
+
+    // === FLAGS ===
     "-user_agent", "Mozilla/5.0",
     "-fflags", "+discardcorrupt+genpts",
-    "-thread_queue_size", "512",
+
+    // ❌ BỎ "-re" — đây là thủ phạm chính gây stall HLS
+    // "-re",
+
+    // === HLS specific (FFmpeg sẽ ignore nếu không phải HLS) ===
+    ...(isHls ? ["-live_start_index", "-3"] : []),
+
+    // === DECODE ===
     "-threads", String(DECODER_THREADS),
     "-filter_threads", "1",
-    "-re",
-    "-i", channel.url,
 
+    // === INPUT ===
+    "-i", channel.url
+  ];
+
+  const outputArgs = [
     // VIDEO
     "-map", "0:v:0?",
     "-an",
@@ -634,6 +630,8 @@ function startFFmpeg(channel) {
     "-f", "s16le",
     "pipe:3"
   ];
+
+  const args = [...inputArgs, ...outputArgs];
 
   const child = spawn("ffmpeg", args, {
     stdio: ["ignore", "pipe", "pipe", "pipe"]
@@ -683,21 +681,16 @@ function startFFmpeg(channel) {
 function scheduleRestart() {
   if (restarting || manuallyStopped) return;
   restarting = true;
-  console.log("[RESTART] Waiting:", RESTART_DELAY);
-
   disconnectAudioClient();
   clearVideoBuffer();
   clearWatchdog();
   stopFrameBroadcastTimer();
-
   if (ffmpeg) {
     const old = ffmpeg;
     ffmpeg = null;
     try { old.kill("SIGKILL"); } catch (_) {}
   }
-
   if (restartTimer) clearTimeout(restartTimer);
-
   restartTimer = setTimeout(() => {
     restartTimer = null;
     restarting = false;
@@ -712,14 +705,10 @@ function scheduleRestart() {
 app.get("/stream", (req, res) => {
   const requestedFps = Number(req.query.fps);
   let clientFps = DEFAULT_CLIENT_FPS;
-
   if (Number.isFinite(requestedFps) && requestedFps > 0) {
     clientFps = Math.max(MIN_CLIENT_FPS, Math.min(MAX_CLIENT_FPS, Math.floor(requestedFps)));
   }
-
   const clientInterval = clientFps >= VIDEO_FPS ? 0 : (1000 / clientFps);
-
-  console.log("[VIDEO] Client connected fps:", clientFps);
 
   res.writeHead(200, {
     "Content-Type": "multipart/x-mixed-replace; boundary=frame",
@@ -732,13 +721,11 @@ app.get("/stream", (req, res) => {
   });
 
   videoClients++;
-
   const state = {
     blocked: false, blockedSince: 0,
     lastSentSequence: -1, clientFps, clientInterval,
     lastSentTime: 0, skippedFrames: 0, blockCount: 0
   };
-
   videoClientsMap.set(res, state);
 
   if (latestFrame && Date.now() - lastVideoFrameTime <= 1500 && frameSequence > 0) {
@@ -768,13 +755,11 @@ app.get("/stream", (req, res) => {
 
 app.get("/audio", (req, res) => {
   disconnectAudioClient();
-
   audioClient = res;
   audioClientSlow = false;
   audioStarted = false;
   audioPrebuffer = [];
   audioPrebufferBytes = 0;
-
   audioBytesReceived = 0;
   audioBytesSent = 0;
   audioBytesDropped = 0;
@@ -787,15 +772,8 @@ app.get("/audio", (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Content-Encoding", "identity");
 
-  console.log(
-    `[AUDIO] Client connected — prebuffer ${AUDIO_PREBUFFER_MS}ms rồi phát ngay`
-  );
-
   res.on("close", () => {
-    if (audioClient === res) {
-      console.log("[AUDIO] Client disconnected");
-      disconnectAudioClient();
-    }
+    if (audioClient === res) disconnectAudioClient();
   });
   res.on("error", () => {
     if (audioClient === res) disconnectAudioClient();
@@ -827,26 +805,21 @@ app.get("/api/channels", (req, res) => {
   const requested = req.query.quality || req.query.q || req.query.max || "720";
   const rawValue = String(requested).trim().toLowerCase();
   let maxResolution = 720;
-
   if (rawValue === "all" || rawValue === "full") {
     maxResolution = Number.MAX_SAFE_INTEGER;
   } else {
     const parsed = Number.parseInt(rawValue, 10);
     if (Number.isFinite(parsed) && parsed > 0) maxResolution = parsed;
   }
-
   const filtered = filterChannelsByResolution(channels, maxResolution);
   const resetSeconds = Math.max(3, Math.ceil(RESTART_DELAY / 1000));
-
   res.json({
     success: true,
     streamQuality: getCurrentQualityPreset().id,
     jpegQuality: getCurrentQualityPreset().jpegQuality,
     quality: maxResolution === Number.MAX_SAFE_INTEGER ? "all" : String(maxResolution),
     channels: filtered.map(channel => ({
-      ...channel,
-      resetSeconds,
-      resetAtMs: Date.now() + resetSeconds * 1000
+      ...channel, resetSeconds, resetAtMs: Date.now() + resetSeconds * 1000
     }))
   });
 });
@@ -888,94 +861,6 @@ app.get("/api/reload", async (req, res) => {
   }
 });
 
-app.get("/api/bandwidth", async (req, res) => {
-  try {
-    if (!RENDER_API_KEY) {
-      return res.status(500).json({ success: false, error: "Missing RENDER_API_KEY" });
-    }
-    if (!RENDER_SERVICE_IDS.length) {
-      return res.status(500).json({ success: false, error: "Missing RENDER_SERVICE_IDS" });
-    }
-    if (!Number.isFinite(BANDWIDTH_LIMIT_GB) || BANDWIDTH_LIMIT_GB <= 0) {
-      return res.status(500).json({ success: false, error: "Invalid BANDWIDTH_LIMIT_GB" });
-    }
-
-    const now = new Date();
-    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-    const url = new URL("https://api.render.com/v1/metrics/bandwidth");
-    url.searchParams.set("startTime", start.toISOString());
-    url.searchParams.set("endTime", now.toISOString());
-    for (const id of RENDER_SERVICE_IDS) url.searchParams.append("resource", id);
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${RENDER_API_KEY}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(20000)
-    });
-
-    if (!response.ok) {
-      const details = await response.text();
-      return res.status(response.status).json({
-        success: false, error: "Render API error",
-        httpStatus: response.status, details
-      });
-    }
-
-    const data = await response.json();
-    if (!Array.isArray(data)) throw new Error("Invalid Render bandwidth response");
-
-    let usedGB = 0;
-    let totalPoints = 0;
-    const services = [];
-
-    for (const series of data) {
-      const labels = Array.isArray(series.labels) ? series.labels : [];
-      const serviceLabel = labels.find(i => i.field === "service");
-      const serviceId = serviceLabel ? serviceLabel.value : "unknown";
-      const unit = String(series.unit || "GB").toUpperCase();
-      let serviceGB = 0;
-      for (const point of (series.values || [])) {
-        const value = Number(point.value);
-        if (!Number.isFinite(value)) continue;
-        if (unit === "GB") serviceGB += value;
-        else if (unit === "MB") serviceGB += value / 1024;
-        else if (["BYTE", "BYTES", "B"].includes(unit)) serviceGB += value / (1024 ** 3);
-        else throw new Error("Unsupported bandwidth unit: " + unit);
-        totalPoints++;
-      }
-      usedGB += serviceGB;
-      services.push({
-        serviceId, usedGB: Number(serviceGB.toFixed(4)), unit,
-        dataPoints: (series.values || []).length
-      });
-    }
-
-    usedGB = Number(usedGB.toFixed(4));
-    const remainingGB = Math.max(0, BANDWIDTH_LIMIT_GB - usedGB);
-    const resetAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
-    const resetInSeconds = Math.max(0, Math.ceil((resetAt.getTime() - Date.now()) / 1000));
-    const usedPercent = Math.min(100, Number((usedGB / BANDWIDTH_LIMIT_GB * 100).toFixed(2)));
-    const remainingPercent = Number((100 - usedPercent).toFixed(2));
-
-    let status = "NORMAL";
-    if (remainingGB <= 0) status = "LIMIT_REACHED";
-    else if (remainingGB <= BANDWIDTH_LIMIT_GB * 0.1) status = "WARNING";
-
-    res.json({
-      success: true, provider: "Render Official API",
-      period: { start: start.toISOString(), end: now.toISOString(), timezone: "UTC" },
-      bandwidth: { limitGB: BANDWIDTH_LIMIT_GB, usedGB, remainingGB, usedPercent, remainingPercent },
-      resetInSeconds, resetAt: resetAt.toISOString(),
-      status, services, serviceCount: RENDER_SERVICE_IDS.length,
-      returnedSeries: data.length, totalDataPoints: totalPoints,
-      updatedAt: new Date().toISOString(),
-      note: "Metrics are delayed and may not equal exact real-time billing balance."
-    });
-  } catch (error) {
-    console.error("[BANDWIDTH ERROR]", error.message);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
 // =====================================================
 // HEALTH
 // =====================================================
@@ -998,9 +883,7 @@ app.get("/health", (req, res) => {
     clientDetails.push({
       fps: state.clientFps,
       skipped: state.skippedFrames,
-      blockCount: state.blockCount,
       blocked: state.blocked,
-      blockDurationMs: state.blocked ? now - state.blockedSince : 0,
       lastSentAgoMs: state.lastSentTime ? now - state.lastSentTime : null
     });
   }
@@ -1010,18 +893,23 @@ app.get("/health", (req, res) => {
     channelCount: channels.length,
     currentChannel: currentChannel ? currentChannel.name : null,
     ffmpegRunning: !!ffmpeg,
-    restarting,
-    manuallyStopped,
-    pipeline: "FIXED_RATE_VIDEO_IMMEDIATE_AUDIO",
+    pipeline: "BUFFERED_INPUT_NO_RE_FIXED_RATE",
 
-    videoWidth: VIDEO_WIDTH,
-    videoHeight: VIDEO_HEIGHT,
     videoFPS: VIDEO_FPS,
     decoderThreads: DECODER_THREADS,
     cpuCores: os.cpus().length,
 
+    // 🔥 CHẨN ĐOÁN QUAN TRỌNG
+    ffmpegUptimeSeconds: ffmpegStartedAt
+      ? Number(((now - ffmpegStartedAt) / 1000).toFixed(1)) : 0,
+    firstFrameDelaySeconds: firstFrameArrivedAt && ffmpegStartedAt
+      ? Number(((firstFrameArrivedAt - ffmpegStartedAt) / 1000).toFixed(2)) : null,
+    inputStallCount,
+    lastStallAgoMs: lastStallAt ? now - lastStallAt : null,
+
     sourceFpsLast2s: calculateFps(2000),
     sourceFpsLast5s: calculateFps(5000),
+    sourceFpsLast10s: calculateFps(10000),
     broadcastTimerActive: !!frameBroadcastTimer,
     lastFrameArrivalAgoMs: lastVideoFrameTime ? now - lastVideoFrameTime : null,
     lastBroadcastAgoMs: lastBroadcastTime ? now - lastBroadcastTime : null,
@@ -1029,41 +917,22 @@ app.get("/health", (req, res) => {
     videoInvalidFrames,
     videoSentFrames,
     videoClients,
-    videoPendingBytes: jpegPending.length,
-    videoLatestFrameBytes: latestFrame ? latestFrame.length : 0,
-    videoFrameAge: lastVideoFrameTime ? now - lastVideoFrameTime : null,
     clientDetails,
 
     audio: {
       clientConnected: !!audioClient && !audioClient.destroyed,
-      clientSlow: audioClientSlow,
       started: audioStarted,
-      prebufferMs: AUDIO_PREBUFFER_MS,
-      prebufferBytes: audioPrebufferBytes,
-      prebufferTargetBytes: AUDIO_PREBUFFER_BYTES,
       bytesReceived: audioBytesReceived,
       bytesSent: audioBytesSent,
       bytesDropped: audioBytesDropped,
       burstDropped: audioBurstDropped,
       dropPercent: audioBytesReceived > 0
-        ? Number((audioBytesDropped / audioBytesReceived * 100).toFixed(2))
-        : 0,
-      clientSocketBufferBytes: audioClient ? audioClient.writableLength : 0,
-      firstByteAgoSeconds: audioFirstByteAt
-        ? Number(((now - audioFirstByteAt) / 1000).toFixed(1))
-        : null,
-      lastByteAgoSeconds: audioLastByteAt
-        ? Number(((now - audioLastByteAt) / 1000).toFixed(1))
-        : null,
-      note: !audioStarted && audioPrebufferBytes > 0
-        ? `Đang prebuffer ${audioPrebufferBytes}/${AUDIO_PREBUFFER_BYTES} bytes`
-        : null
+        ? Number((audioBytesDropped / audioBytesReceived * 100).toFixed(2)) : 0
     },
 
     memory: {
       rssMB: Number((memory.rss / 1048576).toFixed(2)),
-      heapUsedMB: Number((memory.heapUsed / 1048576).toFixed(2)),
-      externalMB: Number((memory.external / 1048576).toFixed(2))
+      heapUsedMB: Number((memory.heapUsed / 1048576).toFixed(2))
     },
 
     generation
@@ -1071,36 +940,28 @@ app.get("/health", (req, res) => {
 });
 
 // =====================================================
-// ROOT
+// ROOT / START
 // =====================================================
 
 app.get("/", (req, res) => {
   res.send(
-    "IPTV SERVER - IMMEDIATE AUDIO + FIXED-RATE VIDEO\n" +
-    "  /stream              → default " + DEFAULT_CLIENT_FPS + " fps\n" +
-    "  /stream?fps=12       → 12 fps\n" +
-    "  /audio               → PCM " + AUDIO_SAMPLE_RATE + "Hz mono s16le (phát ngay)\n" +
-    "  /health              → diagnostics\n" +
-    "\nAudio: prebuffer " + AUDIO_PREBUFFER_MS + "ms rồi phát ngay, không warmup.\n" +
-    "Video: fixed-rate 12fps timer → hình luôn đều bất kể audio burst.\n"
+    "IPTV SERVER - BUFFERED INPUT, NO -re, FIXED-RATE OUTPUT\n" +
+    "  /stream              → " + DEFAULT_CLIENT_FPS + " fps\n" +
+    "  /stream?fps=12\n" +
+    "  /audio               → PCM " + AUDIO_SAMPLE_RATE + "Hz mono\n" +
+    "  /health              → xem inputStallCount để biết FFmpeg có stall không\n"
   );
 });
 
 async function main() {
-  try {
-    await loadChannels();
-  } catch (error) {
-    console.log("[STARTUP] Playlist failed:", error.message);
-  }
+  try { await loadChannels(); }
+  catch (error) { console.log("[STARTUP] Playlist failed:", error.message); }
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log("--------------------------------");
     console.log("IPTV SERVER RUNNING");
     console.log("PORT:", PORT);
-    console.log("CHANNELS:", channels.length);
-    console.log("PIPELINE: IMMEDIATE AUDIO + FIXED-RATE VIDEO");
-    console.log("DECODER THREADS:", DECODER_THREADS, "/ CPU cores:", os.cpus().length);
-    console.log("AUDIO PREBUFFER:", AUDIO_PREBUFFER_MS, "ms");
+    console.log("PIPELINE: BUFFERED INPUT (no -re) + FIXED-RATE OUTPUT");
     console.log("--------------------------------");
   });
 }
