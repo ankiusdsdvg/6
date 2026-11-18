@@ -63,7 +63,7 @@ const AUDIO_BYTES_PER_MS =
 // Startup buffer — prime 1500ms để có đủ slack từ byte đầu tiên
 // (đây là điểm cân bằng: start chậm hơn ~500ms so với bản gốc,
 // nhưng mượt ngay từ đầu thay vì 30s sau mới mượt)
-const AUDIO_START_BUFFER_MS = 1500;
+const AUDIO_START_BUFFER_MS = 3000;
 
 // Buffer tối đa — tăng lên 3500ms để chống jitter 4G (Termux/3G/4G)
 const AUDIO_BUFFER_MS = 3500;
@@ -81,7 +81,7 @@ const AUDIO_TARGET_MIN_MS = 800;
 const AUDIO_TARGET_MAX_MS = 2500;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
-const DECODER_THREADS = 1;   // giảm từ 2 → 1 cho Termux (tránh context switch)
+const DECODER_THREADS = 2;   // giảm từ 2 → 1 cho Termux (tránh context switch)
 const ENCODER_THREADS = 1;
 
 const WATCHDOG_INTERVAL = 5000;
