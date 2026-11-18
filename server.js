@@ -81,7 +81,7 @@ const AUDIO_TARGET_MIN_MS = 800;
 const AUDIO_TARGET_MAX_MS = 2500;
 const AUDIO_STABLE_FRAMES_TO_REDUCE = 50;
 
-const DECODER_THREADS = 1;   // giảm từ 2 → 1 cho Termux (tránh context switch)
+const DECODER_THREADS = 2;   // giảm từ 2 → 1 cho Termux (tránh context switch)
 const ENCODER_THREADS = 1;
 
 const WATCHDOG_INTERVAL = 5000;
