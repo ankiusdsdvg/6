@@ -22,10 +22,10 @@ const DEFAULT_CLIENT_FPS = 12;
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
 
-const JPEG_QUALITY = 10;
-const JPEG_QUALITY_720P = 15;
-const JPEG_QUALITY_540P = 20;
-const JPEG_QUALITY_340P = 25;
+const JPEG_QUALITY = 15;
+const JPEG_QUALITY_720P = 20;
+const JPEG_QUALITY_540P = 25;
+const JPEG_QUALITY_340P = 30;
 
 const VIDEO_INTERVAL = 1000 / VIDEO_FPS;
 
@@ -66,7 +66,7 @@ const AUDIO_BYTES_PER_MS =
 const AUDIO_START_BUFFER_MS = 1500;
 
 // Buffer tối đa — tăng lên 3500ms để chống jitter 4G (Termux/3G/4G)
-const AUDIO_BUFFER_MS = 3500;
+const AUDIO_BUFFER_MS = 1500;
 
 const AUDIO_BUFFER_MAX =
   AUDIO_SAMPLE_RATE *
