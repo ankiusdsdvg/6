@@ -18,7 +18,7 @@ const M3U_URLS = [
 const VIDEO_WIDTH = 320;
 const VIDEO_HEIGHT = 240;
 const VIDEO_FPS = 12;
-const DEFAULT_CLIENT_FPS = 8;
+const DEFAULT_CLIENT_FPS = 12;
 const MIN_CLIENT_FPS = 1;
 const MAX_CLIENT_FPS = 30;
 
